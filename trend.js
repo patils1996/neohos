@@ -50,7 +50,14 @@ const DB = {
     });
   },
 
+  // In-memory copy of the history list: several menus read it, so read IndexedDB once
+  // and reuse it until something is saved or deleted.
+  _cache: null,
+  _cachePromise: null,
+  invalidate() { this._cache = null; this._cachePromise = null; },
+
   saveRecord(record) {
+    this.invalidate();
     return new Promise((resolve, reject) => {
       if (!this.db) return reject(new Error("Database not open"));
       const tx = this.db.transaction('history', 'readwrite');
@@ -62,6 +69,27 @@ const DB = {
   },
 
   getAllRecords() {
+    if (this._cache) return Promise.resolve(this._cache.slice());
+    if (this._cachePromise) return this._cachePromise.then(list => list.slice());
+    const p = this._readAll().then(list => { this._cache = list; this._cachePromise = null; return list; },
+      err => { this._cachePromise = null; throw err; });
+    this._cachePromise = p;
+    return p.then(list => list.slice());
+  },
+
+  /** Newest history record only (no full-table read). */
+  getLatestRecord() {
+    if (this._cache) return Promise.resolve(this._cache[0] || null);
+    return new Promise((resolve, reject) => {
+      if (!this.db) return resolve(null);
+      const tx = this.db.transaction('history', 'readonly');
+      const req = tx.objectStore('history').index('timestamp').openCursor(null, 'prev');
+      req.onsuccess = e => { const c = e.target.result; resolve(c ? c.value : null); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  _readAll() {
     return new Promise((resolve, reject) => {
       if (!this.db) return resolve([]);
       const tx = this.db.transaction('history', 'readonly');
@@ -83,6 +111,7 @@ const DB = {
   },
 
   deleteRecord(id) {
+    this.invalidate();
     return new Promise((resolve, reject) => {
       if (!this.db) return reject(new Error("Database not open"));
       const tx = this.db.transaction('history', 'readwrite');
@@ -212,39 +241,17 @@ document.getElementById('btn-confirm-upload-save').addEventListener('click', asy
   const file = pendingUploadFile;
   const reader = new FileReader();
   reader.onload = async (e) => {
-    const data = new Uint8Array(e.target.result);
     try {
-      const workbook = XLSX.read(data, { type: 'array' });
-      
-      // Process mappings sheet if exists
-      if (workbook.SheetNames.includes('TE-SO Map')) {
-        parseMappingsFromSheet(workbook.Sheets['TE-SO Map']);
-      } else if (workbook.SheetNames.includes('EO-SO Map')) {
-        parseMappingsFromSheet(workbook.Sheets['EO-SO Map']);
+      // Read the workbook in the background (no page freeze)
+      const book = await WorkbookReader.read(e.target.result);
+      const mapAoa = book.byKind('mapping');
+      if (mapAoa) parseMappingsFromSheet(mapAoa);
+      const rawDataSheetName = pickUptimeSheet(book);
+      const parsedData = rawDataSheetName ? book.rows[rawDataSheetName] : [];
+      // A workbook that also carries the tank sheets feeds RO-Wise Tank Stock too
+      if (window.TankStock && (book.byKind('tank_latest') || book.byKind('tank_hourly'))) {
+        window.TankStock.ingestSheets({ latest: book.byKind('tank_latest'), hourly: book.byKind('tank_hourly'), onboarded: book.byKind('tank_onboarded') });
       }
-      
-      // Process raw data sheet
-      let rawDataSheetName = null;
-      if (workbook.SheetNames.includes('Raw Data')) {
-        rawDataSheetName = 'Raw Data';
-      } else {
-        rawDataSheetName = workbook.SheetNames.find(name => name.toLowerCase().includes('raw'));
-      }
-      
-      if (!rawDataSheetName) {
-        // Look for matching names containing charger, list, data, status (case-insensitive)
-        rawDataSheetName = workbook.SheetNames.find(name => {
-          const ln = name.toLowerCase();
-          return ln.includes('charger') || ln.includes('list') || ln.includes('data') || ln.includes('status');
-        });
-      }
-      
-      if (!rawDataSheetName) {
-        rawDataSheetName = workbook.SheetNames[0];
-      }
-      
-      const sheet = workbook.Sheets[rawDataSheetName];
-      const parsedData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       
       if (parsedData.length < 3) {
         showToast("Invalid sheet structure: not enough rows", "error");
@@ -259,6 +266,7 @@ document.getElementById('btn-confirm-upload-save').addEventListener('click', asy
       
       // Construct timestamp
       const timestamp = new Date(`${dateInput}T${timeInput}:00`).getTime();
+      if (window.DataFreshness) DataFreshness.fromUpload(timestamp, file.name);
       
       // Save to IndexedDB
       const record = {
@@ -562,6 +570,16 @@ async function seedMockHistory() {
 let uptimeChartInstance = null;
 let statusChartInstance = null;
 
+// Global Territory filter: recompute each snapshot's metrics for the chosen territories
+function scopeTrendRecords(records) {
+  if (!window.GlobalScope || !GlobalScope.active()) return records;
+  return records.map(rec => {
+    if (rec.__scoped) return rec;
+    const m = Array.isArray(rec.rawData) ? GlobalScope.metricsFor(rec.rawData) : null;
+    return m ? Object.assign({}, rec, { metrics: Object.assign({}, rec.metrics, m), __scoped: true }) : rec;
+  });
+}
+
 async function loadUploadHistory() {
   if (!DB.db) {
     await DB.open();
@@ -575,6 +593,8 @@ async function loadUploadHistory() {
     records = await DB.getAllRecords();
   }
   
+  records = scopeTrendRecords(records);
+
   // Recalculate yesterday vs today card values
   await calculateYesterdayVsToday(records);
   
@@ -587,6 +607,7 @@ window.renderHistoryAndCharts = async function(recordsList) {
   if (!records) {
     records = await DB.getAllRecords();
   }
+  records = scopeTrendRecords(records);
   
   const granularity = document.getElementById('trend-granularity-select').value;
   

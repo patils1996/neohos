@@ -136,6 +136,42 @@ Builds the day-end automation MIS from stored snapshots. Every upload / Sheet sy
 
 Every filter dropdown that starts with "All …" now accepts several choices at once, for example Fully Online + Offline, or two sales areas:
 - RO Explorer, Day Monitoring, Monitoring, 3-Day Comparison, MIS Dashboard, Outlets Status, RO-Wise Tank Stock and Day End MIS.
-- The Dashboard filter pills (Sales Areas, TE, Vendors, Uptime Status) work the same way: tap a pill to add it, tap it again to remove it.
+- The Dashboard has a filter bar at the top (Sales Area, Territory Engineer, Vendor, Uptime Status, Technology) using the same dropdowns. It shows how many filters are active and has a **Clear filters** button.
 
 Each dropdown has Select all, Clear and Done buttons, plus search when there are many options. On phones it opens as a bottom sheet. The logic lives in `multiselect.js` / `multiselect.css`; use `MS.vals(id)` and `MS.ok(values, v)` in filter code.
+
+## 🗺️ Territory filter (all menus)
+
+- **Where it is:** the **Territory** dropdown is in the Dashboard filter bar, the MIS Dashboard filter bar, the Tank Stock filters, and a navy strip at the top of every other menu.
+- **What it does:** choosing territories in any of these applies to **every menu**. That covers the Dashboard, summaries, RO Explorer, Day Monitoring, Monitoring, Comparison, Performance Trend, Outlets Status, MIS, Day End MIS and Tank Stock.
+- **Memory:** the choice is remembered on the device. **Clear filters** resets it.
+- **Where the values come from:** the `Territory` column of the uptime Excel (`State Office` and `Region` are read too). Snapshots saved before this update have no territory recorded, so they stay visible under any territory.
+- **For developers:** the logic is in `scope_filter.js` (`GlobalScope.get / match / set`).
+- **MIS Dashboard:** it now has its own filter bar (Territory, Sales Area, TE, Vendor, RO Status, Technology), and its KPIs, bars and table follow it.
+
+## Google Sheet sync — one workbook for Uptime + Tank Stock (v11)
+
+All data now comes from the **same published Google workbook** (no Google Drive connection needed).
+Keep these tabs in it (names are matched loosely, order does not matter):
+
+| Sheet | Used for | Name must contain |
+|---|---|---|
+| 1. Raw Data | Automation uptime monitoring (unchanged format) | `Raw Data` (or "uptime" / "automation") |
+| 2. Last updated stock | Tank latest stock | `last` / `latest` / `current` + `stock` |
+| 3. Stock hourly | Tank hourly trend | `hourly` |
+| 4. Onboarded tanks | Tank mapping / online status | `onboard` (or "tank master" / "tank list") |
+| TE-SO Mapping, HistoryArchive | Optional, as before | — |
+
+**How updates reach the app**
+- On login the sheet is read, and again every **5 minutes** while the page is open (and when you return to the tab). Change the interval with `localStorage.bpcl_sheet_autosync_min`.
+- "Sync Sheet" / "Sync from Sheet" forces a refresh at any time.
+- If the workbook has not changed, nothing is re-processed ("Already up to date").
+- Google's *Publish to web* copy can take up to ~5 minutes to show new edits.
+- Tank Stock takes each outlet's territory / sales area from the uptime sheet (by RO code), so the global Territory filter works the same on every menu.
+
+**Speed changes**
+- The workbook is read in a background worker (`xlsx_worker.js`), so the page never freezes.
+- Two-stage read: the uptime sheet is ready in ~1–2 s; the large hourly tank sheet follows in the background.
+- Unchanged workbooks are skipped by a fingerprint check.
+- New history snapshots no longer store a full copy of the workbook, and identical snapshots are skipped.
+- History records are cached in memory instead of being re-read from the database on every screen.

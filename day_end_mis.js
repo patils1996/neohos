@@ -190,6 +190,7 @@
         roid: roid,
         outlet_name: row.outlet_name || m.outlet_name || ('RO ' + roid),
         sales_area: row.sales_area || m.sales_area || 'Unmapped',
+        territory: row.territory || m.territory || '',
         eo_name: m.eo_name || 'Unmapped',
         so_name: m.so_name || 'Unmapped',
         mst_name: m.mst_name || 'Unmapped',
@@ -210,6 +211,9 @@
         full: full
       };
     });
+
+    // Global Territory filter (shared by every menu)
+    if (window.GlobalScope && GlobalScope.active()) list = list.filter(function (r) { return GlobalScope.match(r.territory); });
 
     // Same role scoping as the rest of the dashboard
     var u = window.currentUser;
@@ -282,7 +286,7 @@
 
   /** {roid: status} for a history record (cached), honouring role + filters + basis. */
   function statusMapFor(rec) {
-    var ck = rec.id + '|' + S.basis + '|' + S.filters.area.join(',') + '|' + S.filters.te.join(',') + '|' + S.filters.vendor.join(',');
+    var ck = rec.id + '|' + S.basis + '|' + (window.GlobalScope ? GlobalScope.get().join(',') : '') + '|' + S.filters.area.join(',') + '|' + S.filters.te.join(',') + '|' + S.filters.vendor.join(',');
     if (S.statusCache[ck]) return S.statusCache[ck];
     var out = {};
     applyFilters(computeROs(rec.rawData).list).forEach(function (ro) { out[ro.roid] = statusOf(ro); });
@@ -394,7 +398,7 @@
       generatedAt: new Date(),
       generatedBy: (window.currentUser && (window.currentUser.username || window.currentUser.role)) || 'User',
       basisLabel: S.basis === 'colv' ? "Column V (RO's Online)" : 'Equipment count (MPD + ATG)',
-      filterLabel: [S.filters.area.length && ('Sales Area: ' + S.filters.area.join(', ')), S.filters.te.length && ('TE: ' + S.filters.te.join(', ')),
+      filterLabel: [window.GlobalScope && GlobalScope.active() && ('Territory: ' + GlobalScope.get().join(', ')), S.filters.area.length && ('Sales Area: ' + S.filters.area.join(', ')), S.filters.te.length && ('TE: ' + S.filters.te.join(', ')),
         S.filters.vendor.length && ('Vendor: ' + S.filters.vendor.join(', '))].filter(Boolean).join(' · ') || 'All outlets'
     };
   }

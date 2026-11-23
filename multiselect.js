@@ -32,7 +32,11 @@
     // RO-Wise Tank Stock
     'territory', 'area', 'vendor', 'state',
     // Day End MIS Exporter
-    'dem-f-area', 'dem-f-te', 'dem-f-vendor'
+    'dem-f-area', 'dem-f-te', 'dem-f-vendor',
+    // Dashboard filter bar
+    'dash-f-territory', 'dash-f-area', 'dash-f-te', 'dash-f-vendor', 'dash-f-status', 'dash-f-tech',
+    // Global territory strip + MIS Dashboard filter bar
+    'scope-territory', 'mis-f-territory', 'mis-f-area', 'mis-f-te', 'mis-f-vendor', 'mis-f-status', 'mis-f-tech'
   ];
 
   var registry = new Map(); // select element -> widget

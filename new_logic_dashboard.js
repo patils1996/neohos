@@ -6,6 +6,8 @@
 
   const $ = id => document.getElementById(id);
   let allRows = [], headers = [], filteredRows = [];
+  let viewRows = [];        // allRows after the MIS filter bar (territory, area, TE, vendor, status, technology)
+  let misFiltersBound = false;
 
   const aliases = {
     id: ['RO ID', 'ROID', 'roid', 'ro_id', 'BL Code', 'CC Code', 'Outlet Code'],
@@ -18,7 +20,10 @@
     atgOnline: ['No. of Online Tanks', 'ATG Online', 'onl_tnk', 'Online Tanks', 'Tank Online', 'No. of Online ATG'],
     mpdPct: ['MPD Online%', 'MPD Online %', 'mpd_online_pct', 'MPD Online pct'],
     atgPct: ['Tank Online%', 'Tank Online %', 'ATG Online%', 'ATG Online %', 'tank_online_pct', 'atg_online_pct'],
-    roStatus: ["RO's Online", 'RO Online', 'RO Status', 'Outlet Status', 'ro_online_status', 'status']
+    roStatus: ["RO's Online", 'RO Online', 'RO Status', 'Outlet Status', 'ro_online_status', 'status'],
+    territory: ['Territory', 'territory', 'Territory Name'],
+    te: ['TE Name', 'TE', 'eo_name', 'EO Name', 'Territory Engineer'],
+    iot: ['IOT Enabled', 'iot_enabled', 'IOT', 'Technology']
   };
 
   function norm(s) {
@@ -120,6 +125,70 @@
     }[c]));
   }
 
+  // ---- MIS filter bar -------------------------------------------------
+  function teOf(r) {
+    const t = String(getCol(r, 'te') || '').trim();
+    if (t) return t;
+    const id = String(getCol(r, 'id') || '').trim();
+    const m = (window.activeMappings || {})[id];
+    return (m && m.eo_name) || 'Unmapped';
+  }
+  function techOf(r) {
+    const v = String(getCol(r, 'iot') || '').trim().toLowerCase();
+    if (!v) return 'WFCC';
+    return (v === 'yes' || v === 'iot' || v === 'y' || v === 'true') ? 'IOT' : 'WFCC';
+  }
+  const MIS_FILTERS = [
+    { id: 'mis-f-area', all: 'All Sales Areas', get: r => String(getCol(r, 'area') || 'Unassigned') },
+    { id: 'mis-f-te', all: 'All TEs', get: teOf },
+    { id: 'mis-f-vendor', all: 'All Vendors', get: r => String(getCol(r, 'vendor') || 'Unassigned') },
+    { id: 'mis-f-status', all: 'All Statuses', get: r => statusOf(r) },
+    { id: 'mis-f-tech', all: 'All Technologies', get: techOf }
+  ];
+  function computeViewRows() {
+    // Territory is the global scope shared with every menu
+    const inScope = allRows.filter(r => !window.GlobalScope || GlobalScope.match(getCol(r, 'territory')));
+    if (window.GlobalScope) GlobalScope.registerTerritories(allRows.map(r => getCol(r, 'territory')));
+    // Options come from rows in the chosen territory
+    MIS_FILTERS.forEach(cfg => {
+      const sel = $(cfg.id);
+      if (!sel) return;
+      const vals = [...new Set(inScope.map(cfg.get))].filter(Boolean).sort();
+      const keep = (window.MS ? MS.vals(sel) : (sel.value ? [sel.value] : [])).filter(v => vals.includes(v));
+      sel.innerHTML = `<option value="">${cfg.all}</option>` + vals.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+      if (window.MS) MS.set(sel, keep); else sel.value = keep[0] || '';
+    });
+    if (!misFiltersBound) {
+      misFiltersBound = true;
+      MIS_FILTERS.forEach(cfg => { const sel = $(cfg.id); if (sel) sel.addEventListener('change', render); });
+      const reset = $('mis-filter-reset');
+      if (reset) reset.addEventListener('click', () => {
+        MIS_FILTERS.forEach(cfg => { const sel = $(cfg.id); if (sel && window.MS) MS.set(sel, []); });
+        if (window.GlobalScope && GlobalScope.active()) GlobalScope.set([]); else render();
+      });
+    }
+    const picks = MIS_FILTERS.map(cfg => ({ cfg, vals: $(cfg.id) && window.MS ? MS.vals($(cfg.id)) : [] }));
+    const rows = inScope.filter(r => picks.every(p => !p.vals.length || p.vals.includes(String(p.cfg.get(r)))));
+    const active = picks.reduce((n, p) => n + p.vals.length, 0) + (window.GlobalScope ? GlobalScope.get().length : 0);
+    const cnt = $('mis-filter-count');
+    if (cnt) { cnt.hidden = !active; cnt.textContent = active ? active + ' active' : ''; }
+    const reset = $('mis-filter-reset');
+    if (reset) reset.style.display = active ? 'inline-flex' : 'none';
+    return rows;
+  }
+
+  // Rows shown grouped by Sales Area (A–Z, unassigned last), then RO code
+  function sortByArea(rows) {
+    return rows.sort((a, b) => {
+      const aa = String(getCol(a, 'area') || '').trim(), ba = String(getCol(b, 'area') || '').trim();
+      const ua = !aa || aa === 'Unmapped', ub = !ba || ba === 'Unmapped';
+      if (ua !== ub) return ua ? 1 : -1;
+      const c = aa.localeCompare(ba, 'en', { sensitivity: 'base' });
+      if (c) return c;
+      return (parseInt(String(getCol(a, 'id')).replace(/\D/g, ''), 10) || 0) - (parseInt(String(getCol(b, 'id')).replace(/\D/g, ''), 10) || 0);
+    });
+  }
+
   function render() {
     if (!allRows || !allRows.length) {
       if ($('empty')) $('empty').style.display = 'block';
@@ -129,15 +198,20 @@
     if ($('empty')) $('empty').style.display = 'none';
     if ($('dashboard')) $('dashboard').style.display = 'block';
 
-    const totalMPDOn = sum(allRows, 'mpdOn');
-    const totalMPDOnline = sum(allRows, 'mpdOnline');
-    const totalATGOn = sum(allRows, 'atgOn');
-    const totalATGOnline = sum(allRows, 'atgOnline');
+    viewRows = sortByArea(computeViewRows());
+    if ($('reportMeta')) $('reportMeta').textContent = viewRows.length === allRows.length
+      ? allRows.length + ' outlets analyzed'
+      : viewRows.length + ' of ' + allRows.length + ' outlets (filtered)';
+
+    const totalMPDOn = sum(viewRows, 'mpdOn');
+    const totalMPDOnline = sum(viewRows, 'mpdOnline');
+    const totalATGOn = sum(viewRows, 'atgOn');
+    const totalATGOnline = sum(viewRows, 'atgOnline');
 
     const mpdEq = totalMPDOn ? totalMPDOnline / totalMPDOn : NaN;
     const atgEq = totalATGOn ? totalATGOnline / totalATGOn : NaN;
-    const mpd2 = averagePct(allRows, 'mpdPct');
-    const atg2 = averagePct(allRows, 'atgPct');
+    const mpd2 = averagePct(viewRows, 'mpdPct');
+    const atg2 = averagePct(viewRows, 'atgPct');
 
     setMetric('mpdEquip', 'mpdEquipBar', mpdEq);
     setMetric('atgEquip', 'atgEquipBar', atgEq);
@@ -152,12 +226,12 @@
     }
 
     const statuses = {};
-    allRows.forEach(r => {
+    viewRows.forEach(r => {
       let s = statusOf(r);
       statuses[s] = (statuses[s] || 0) + 1;
     });
 
-    const total = allRows.length;
+    const total = viewRows.length;
     const fully = Object.entries(statuses).filter(([s]) => norm(s).includes('fully')).reduce((a, [, v]) => a + v, 0);
     const affected = Object.entries(statuses).filter(([s]) => norm(s).includes('offline') || norm(s).includes('partial')).reduce((a, [, v]) => a + v, 0);
 
@@ -182,7 +256,7 @@
     }
 
     const area = {}, vendor = {};
-    allRows.forEach(r => {
+    viewRows.forEach(r => {
       let s = norm(statusOf(r));
       if (s.includes('offline') || s.includes('partial')) {
         let a = String(getCol(r, 'area') || 'Unassigned');
@@ -215,7 +289,7 @@
     const sf = $('statusFilter');
     if (!sf) return;
     const old = window.MS ? MS.vals(sf) : (sf.value ? [sf.value] : []);
-    const opts = [...new Set(allRows.map(statusOf))].sort();
+    const opts = [...new Set(viewRows.map(statusOf))].sort();
     sf.innerHTML = '<option value="">All outlet statuses</option>' + opts.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
     if (window.MS) MS.set(sf, old.filter(v => opts.includes(v)));
 
@@ -231,10 +305,10 @@
     const q = sb ? norm(sb.value) : '';
     const s = sf ? MS.vals(sf) : [];
 
-    filteredRows = allRows.filter(r => MS.ok(s, statusOf(r)) && (!q || headers.some(h => norm(r[h]).includes(q))));
+    filteredRows = viewRows.filter(r => MS.ok(s, statusOf(r)) && (!q || headers.some(h => norm(r[h]).includes(q))));
 
     if ($('tableCount')) {
-      let countTxt = `Showing ${filteredRows.length.toLocaleString('en-IN')} of ${allRows.length.toLocaleString('en-IN')} outlets`;
+      let countTxt = `Showing ${filteredRows.length.toLocaleString('en-IN')} of ${viewRows.length.toLocaleString('en-IN')} outlets`;
       if (filteredRows.length > 1000) countTxt += ' · First 1,000 rows displayed; CSV export includes all filtered rows.';
       $('tableCount').textContent = countTxt;
     }
@@ -317,7 +391,7 @@
 
     if (window.calculatedROs && Array.isArray(window.calculatedROs) && window.calculatedROs.length > 0) {
       headers = [
-        'RO ID', 'Retail Outlet', 'RA Vendor', 'Sales Area',
+        'RO ID', 'Retail Outlet', 'RA Vendor', 'Sales Area', 'Territory',
         'No. of On-Boarded MPDs', 'No. of Online MPDs', 'MPD Online%',
         'No. of On-Boarded Tanks', 'No. of Online Tanks', 'Tank Online%',
         "RO's Online"
@@ -327,6 +401,9 @@
         'Retail Outlet': ro.outlet_name,
         'RA Vendor': ro.vendor,
         'Sales Area': ro.sales_area,
+        'Territory': ro.territory || '',
+        'TE Name': ro.eo_name || '',
+        'IOT Enabled': ro.iot_status === 'IOT' ? 'Yes' : 'No',
         'No. of On-Boarded MPDs': ro.onb_mpd,
         'No. of Online MPDs': ro.onl_mpd,
         'MPD Online%': (ro.mpd_online_pct !== null && ro.mpd_online_pct !== undefined) ? ro.mpd_online_pct : '',
@@ -345,7 +422,7 @@
 
     if (window.rawDataRows && Array.isArray(window.rawDataRows) && window.rawDataRows.length > 0) {
       headers = [
-        'RO ID', 'Retail Outlet', 'RA Vendor', 'Sales Area',
+        'RO ID', 'Retail Outlet', 'RA Vendor', 'Sales Area', 'Territory',
         'No. of On-Boarded MPDs', 'No. of Online MPDs', 'MPD Online%',
         'No. of On-Boarded Tanks', 'No. of Online Tanks', 'Tank Online%',
         "RO's Online"
@@ -355,6 +432,8 @@
         'Retail Outlet': r.outlet_name,
         'RA Vendor': r.vendor,
         'Sales Area': r.sales_area,
+        'Territory': r.territory || '',
+        'IOT Enabled': r.iot_enabled || '',
         'No. of On-Boarded MPDs': r.onb_mpd,
         'No. of Online MPDs': r.onl_mpd,
         'MPD Online%': (r.mpd_online_pct !== null && r.mpd_online_pct !== undefined) ? r.mpd_online_pct : '',

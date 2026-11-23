@@ -18,6 +18,18 @@ var defaultMappings = window.defaultMappings;
 var customMappings = window.customMappings;
 var activeMappings = window.activeMappings;
 var rawDataRows = window.rawDataRows;
+
+// Default outlet order everywhere: Sales Area (A–Z, Unmapped last), then RO code
+function compareBySalesArea(a, b) {
+  const aa = String((a && a.sales_area) || '').trim(), ba = String((b && b.sales_area) || '').trim();
+  const ua = !aa || aa === 'Unmapped', ub = !ba || ba === 'Unmapped';
+  if (ua !== ub) return ua ? 1 : -1;
+  const c = aa.localeCompare(ba, 'en', { sensitivity: 'base' });
+  if (c) return c;
+  const ra = parseInt(String(a.roid || '').replace(/\D/g, ''), 10) || 0, rb = parseInt(String(b.roid || '').replace(/\D/g, ''), 10) || 0;
+  return ra - rb;
+}
+window.compareBySalesArea = compareBySalesArea;
 var calculatedROs = window.calculatedROs;
 var salesAreaSummary = window.salesAreaSummary;
 var eoSummary = window.eoSummary;
@@ -33,7 +45,7 @@ let salesAreaBarChartInstance = null;
 // Pagination and Sorting states
 const RO_PAGE_SIZE = 15;
 let roCurrentPage = 1;
-let roSortField = 'roid';
+let roSortField = 'sales_area'; // default: grouped by sales area, then RO code
 let roSortAsc = true;
 let roFilteredList = [];
 
@@ -100,15 +112,15 @@ window.addEventListener('DOMContentLoaded', async () => {
   const syncBtn = document.getElementById('btn-sync-sheet');
   const syncBtnLanding = document.getElementById('btn-sync-sheet-landing');
   if (syncBtn) {
-    syncBtn.addEventListener('click', window.syncGoogleSheet);
+    syncBtn.addEventListener('click', () => window.syncGoogleSheet(false));
   }
   if (syncBtnLanding) {
-    syncBtnLanding.addEventListener('click', window.syncGoogleSheet);
+    syncBtnLanding.addEventListener('click', () => window.syncGoogleSheet(false));
   }
 
   // Bind Google Sheet Link Configuration
   const setupGoogleSheetLink = () => {
-    const currentUrl = localStorage.getItem('bpcl_google_sheet_url') || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3EE_SNele4ucfWLc38wDtMaSB18jj2OgCw-Ze8D76Xt5657yylbThfpJ3GF9_9-I6bCcudKh4z42o/pub?output=csv';
+    const currentUrl = localStorage.getItem('bpcl_google_sheet_url') || 'https://docs.google.com/spreadsheets/d/14KDPhrCgKmZzLKNzSdS6YtPIeXdDtlXPbbPWMVxFA5I/export?format=xlsx';
     const newUrl = prompt("Enter your Google Sheet URL:\n(Either copy the address bar link, or use File > Share > Publish to web > CSV Link)", currentUrl);
     if (newUrl !== null && newUrl.trim() !== "") {
       localStorage.setItem('bpcl_google_sheet_url', newUrl.trim());
@@ -153,12 +165,17 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
   };
 
-  // Auto-sync Google Sheet on startup with local database fallback
-  try {
-    await window.syncGoogleSheet(true); // Try silent auto-sync
-  } catch (err) {
-    console.warn("Auto Google Sheet sync failed on startup, loading from local IndexedDB backup...", err);
-    await restoreLatestFromHistory();
+  // Startup: show the copy saved on this device straight away, then refresh from Google
+  const shownFromCache = await window.loadFromSheetCache();
+  if (shownFromCache) {
+    window.syncGoogleSheet(true).catch(err => console.warn('Background Google Sheet refresh failed; showing the saved copy.', err));
+  } else {
+    try {
+      await window.syncGoogleSheet(true); // first run on this device
+    } catch (err) {
+      console.warn("Auto Google Sheet sync failed on startup, loading from local IndexedDB backup...", err);
+      await restoreLatestFromHistory();
+    }
   }
 });
 
@@ -402,7 +419,8 @@ function setupEventListeners() {
     exportToCSV(eoSummary, 'TE_Summary.csv', false);
   });
   document.getElementById('export-so-btn').addEventListener('click', () => {
-    exportToCSV(soSummary, 'SO_Summary.csv', false);
+    const rows = (window.territorySummary || []).concat(window.territorySummaryTotal && window.territorySummary.length > 1 ? [window.territorySummaryTotal] : []);
+    exportToCSV(rows, 'Territory_Summary.csv', false);
   });
   const exportVendorBtn = document.getElementById('export-vendor-btn');
   if (exportVendorBtn) {
@@ -532,52 +550,33 @@ function recalculateAndRefresh() {
     if (typeof window.renderNewLogicDashboard === 'function') {
       window.renderNewLogicDashboard();
     }
+
+    if (typeof window.renderTerritoryPerformance === 'function') {
+      window.renderTerritoryPerformance();
+    }
+    if (window.DataFreshness) window.DataFreshness.render();
+    if (typeof window.renderDashboardExtraCharts === 'function') window.renderDashboardExtraCharts();
   }
 }
 
 // File Processing
 window.handleUploadedFile = function(file) {
   const reader = new FileReader();
-  reader.onload = (e) => {
-    const data = new Uint8Array(e.target.result);
+  reader.onload = async (e) => {
     try {
-      const workbook = XLSX.read(data, { type: 'array' });
-      
-      // 1. Process Mappings sheet if exists
-      if (workbook.SheetNames.includes('TE-SO Map')) {
-        parseMappingsFromSheet(workbook.Sheets['TE-SO Map']);
-      } else if (workbook.SheetNames.includes('EO-SO Map')) {
-        parseMappingsFromSheet(workbook.Sheets['EO-SO Map']);
+      // Read the workbook in the background (no page freeze)
+      const book = await WorkbookReader.read(e.target.result);
+      const mapAoa = book.byKind('mapping');
+      if (mapAoa) parseMappingsFromSheet(mapAoa);
+      const rawDataSheetName = pickUptimeSheet(book);
+      const parsedData = rawDataSheetName ? book.rows[rawDataSheetName] : [];
+      if (window.TankStock && (book.byKind('tank_latest') || book.byKind('tank_hourly'))) {
+        window.TankStock.ingestSheets({ latest: book.byKind('tank_latest'), hourly: book.byKind('tank_hourly'), onboarded: book.byKind('tank_onboarded') });
       }
-      
-      // 2. Locate raw data sheet
-      let rawDataSheetName = null;
-      if (workbook.SheetNames.includes('Raw Data')) {
-        rawDataSheetName = 'Raw Data';
-      } else {
-        // Look for matching names (case-insensitive)
-        rawDataSheetName = workbook.SheetNames.find(name => name.toLowerCase().includes('raw'));
-      }
-      
-      if (!rawDataSheetName) {
-        // Look for matching names containing charger, list, data, status (case-insensitive)
-        rawDataSheetName = workbook.SheetNames.find(name => {
-          const ln = name.toLowerCase();
-          return ln.includes('charger') || ln.includes('list') || ln.includes('data') || ln.includes('status');
-        });
-      }
-      
-      if (!rawDataSheetName) {
-        // Fallback to first sheet
-        rawDataSheetName = workbook.SheetNames[0];
-      }
-      
-      const sheet = workbook.Sheets[rawDataSheetName];
-      const parsedData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-      
+
       // Cache raw sheet JSON objects for New Logic Dashboard
       try {
-        window.rawSheetObjects = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
+        window.rawSheetObjects = WorkbookReader.aoaToObjects(parsedData, '');
         window.lastUploadedFileName = file.name;
       } catch (eRaw) {
         console.warn('Could not cache rawSheetObjects', eRaw);
@@ -592,6 +591,7 @@ window.handleUploadedFile = function(file) {
       parseRawData(parsedData);
       
       // Recalculate
+      if (window.DataFreshness) DataFreshness.fromUpload(file.lastModified || Date.now(), file.name);
       recalculateAndRefresh();
       
       // Switch view from upload landing to active dashboard
@@ -636,7 +636,7 @@ function handleMappingsImportFile(file) {
 
 // Parses the mappings sheet
 function parseMappingsFromSheet(sheet) {
-  const parsed = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+  const parsed = Array.isArray(sheet) ? sheet : XLSX.utils.sheet_to_json(sheet, { header: 1 });
   if (parsed.length < 2) return;
   
   // Find header row (must contain ROID)
@@ -736,6 +736,9 @@ function parseAutomationData(rows, headerRowIdx, headers) {
   const nameCol = headers.findIndex(h => h.includes('retail') || h.includes('ro name') || h.includes('outlet name') || h === 'outlet');
   const vendorCol = headers.findIndex(h => h.includes('vendor') || h.includes('ra vendo') || h.includes('ra vendor'));
   const areaCol = headers.findIndex(h => h.includes('sales area') || h.includes('salesarea') || h.includes('sales_area'));
+  const territoryCol = headers.findIndex(h => h === 'territory' || h === 'territory name' || h === 'territory_name');
+  const stateOfficeCol = headers.findIndex(h => h === 'state office' || h === 'stateoffice' || h === 'state_office');
+  const regionCol = headers.findIndex(h => h === 'region' || h === 'zone');
   
   let onbMpdCol = headers.findIndex(h => h.includes('on-boarded mpd') || h.includes('onbmpd') || h.includes('onb_mpd') || h === 'onbd mpd');
   let onlMpdCol = headers.findIndex(h => h.includes('online mpd') || h.includes('onlmpd') || h.includes('onl_mpd'));
@@ -821,6 +824,9 @@ function parseAutomationData(rows, headerRowIdx, headers) {
       outlet_name: nameCol !== -1 && row[nameCol] ? String(row[nameCol]).trim() : "",
       vendor: vendorCol !== -1 && row[vendorCol] ? String(row[vendorCol]).trim() : "",
       sales_area: areaCol !== -1 && row[areaCol] ? String(row[areaCol]).trim() : "Unmapped",
+      territory: territoryCol !== -1 && row[territoryCol] ? String(row[territoryCol]).trim() : "",
+      state_office: stateOfficeCol !== -1 && row[stateOfficeCol] ? String(row[stateOfficeCol]).trim() : "",
+      region: regionCol !== -1 && row[regionCol] ? String(row[regionCol]).trim() : "",
       onb_mpd: onbMpdCol !== -1 && row[onbMpdCol] !== undefined ? parseFloat(row[onbMpdCol]) : 0,
       onl_mpd: onlMpdCol !== -1 && row[onlMpdCol] !== undefined ? parseFloat(row[onlMpdCol]) : 0,
       onb_tnk: onbTnkCol !== -1 && row[onbTnkCol] !== undefined ? parseFloat(row[onbTnkCol]) : 0,
@@ -969,6 +975,9 @@ function processCalculations(rows) {
       roid: row.roid,
       outlet_name: outlet_name,
       sales_area: row.sales_area,
+      territory: row.territory || (activeMappings[row.roid] && activeMappings[row.roid].territory) || '',
+      state_office: row.state_office || '',
+      region: row.region || '',
       eo_name: eo_name,
       so_name: so_name,
       mst_name: mst_name,
@@ -995,6 +1004,9 @@ function processCalculations(rows) {
     });
   });
   
+  // Present outlets grouped by sales area (then RO code) on every menu
+  calculatedROs.sort(compareBySalesArea);
+
   // Filter based on logged in user scope
   if (window.currentUser) {
     const { role, username } = window.currentUser;
@@ -1012,16 +1024,45 @@ function processCalculations(rows) {
     filtered.forEach(item => calculatedROs.push(item));
   }
   
-  // Reset dashboard filters on new file upload
-  dashboardFilters = {
-    salesArea: null,
-    eoName: null,
-    vendor: null,
-    status: null,
-    technology: null
-  };
+  // RO code → territory / sales area from the uptime sheet (before the territory
+  // scope is applied) — other menus such as Tank Stock use it so every menu
+  // groups outlets the same way.
+  {
+    const look = new Map();
+    calculatedROs.forEach(ro => { if (ro.roid != null) look.set(String(ro.roid).replace(/\D/g, '').replace(/^0+/, ''), { territory: ro.territory || '', area: ro.sales_area || '' }); });
+    window.__roLookup = look;
+    if (window.TankStock && window.TankStock.refreshLookup) window.TankStock.refreshLookup();
+  }
+
+  // Unscoped copy (role scope applied) for Territory Performance ranking
+  window.__unscopedROs = calculatedROs.slice();
+
+  // Global Territory filter (chosen on any menu, applies to every menu)
+  if (window.GlobalScope) {
+    GlobalScope.registerTerritories(calculatedROs.map(ro => ro.territory));
+    if (GlobalScope.active()) {
+      const inScope = calculatedROs.filter(ro => GlobalScope.match(ro.territory));
+      calculatedROs.length = 0;
+      inScope.forEach(item => calculatedROs.push(item));
+    }
+  }
+
+  // Reset dashboard filters on new file upload (kept when only the territory changed)
+  if (!window.__keepDashFilters) {
+    dashboardFilters = {
+      salesArea: null,
+      eoName: null,
+      vendor: null,
+      status: null,
+      technology: null
+    };
+  }
 
   dashboardFilteredROs = calculatedROs;
+  if (window.__keepDashFilters && typeof applyDashboardFilters === 'function' &&
+      ['salesArea', 'eoName', 'vendor', 'status', 'technology'].some(k => dfArr(k).length)) {
+    setTimeout(applyDashboardFilters, 0);
+  }
 
   // Recalculate summaries
   aggregateSummaries();
@@ -1216,85 +1257,46 @@ let dashboardFilters = {
 };
 
 // Render mockup interactive filter panels
+// Dashboard filter bar: one multi-select dropdown per dimension
+const DASH_FILTERS = [
+  { id: 'dash-f-area', key: 'salesArea', all: 'All Sales Areas', values: () => [...new Set(calculatedROs.map(ro => ro.sales_area))].filter(Boolean).sort(), label: v => v.replace(' Retail', '').replace('-retail', '') },
+  { id: 'dash-f-te', key: 'eoName', all: 'All TEs', values: () => [...new Set(calculatedROs.map(ro => ro.eo_name))].filter(Boolean).sort(), label: v => v },
+  { id: 'dash-f-vendor', key: 'vendor', all: 'All Vendors', values: () => [...new Set(calculatedROs.map(ro => ro.vendor))].filter(Boolean).sort(), label: v => v },
+  { id: 'dash-f-status', key: 'status', all: 'All Statuses', values: () => ['Fully Online', 'Partially Online', 'Offline'], label: v => v },
+  { id: 'dash-f-tech', key: 'technology', all: 'All Technologies', values: () => ['IOT', 'WFCC'], label: v => v }
+];
+let dashFiltersBound = false;
+
 function renderFilterButtons() {
-  // We will pull the unique values directly from the base `calculatedROs`
-  const uniqueAreas = [...new Set(calculatedROs.map(ro => ro.sales_area))].filter(Boolean).sort();
-  const uniqueEos = [...new Set(calculatedROs.map(ro => ro.eo_name))].filter(Boolean).sort();
-  const uniqueVendors = [...new Set(calculatedROs.map(ro => ro.vendor))].filter(Boolean).sort();
-  const uniqueStatuses = ["Fully Online", "Partially Online", "Offline"];
+  const escOpt = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  DASH_FILTERS.forEach(cfg => {
+    const sel = document.getElementById(cfg.id);
+    if (!sel) return;
+    const vals = cfg.values();
+    sel.innerHTML = `<option value="">${cfg.all}</option>` + vals.map(v => `<option value="${escOpt(v)}">${escOpt(cfg.label(v))}</option>`).join('');
+    const keep = dfArr(cfg.key).filter(v => vals.includes(v));
+    if (window.MS) MS.set(sel, keep); else sel.value = keep[0] || '';
+  });
 
-  // 1. Sales Areas
-  const areaContainer = document.getElementById('dash-filter-areas');
-  if (areaContainer) {
-    areaContainer.innerHTML = '';
-    uniqueAreas.forEach(area => {
-      const pill = document.createElement('button');
-      pill.className = 'filter-pill' + (dfHas('salesArea', area) ? ' active' : '');
-      pill.textContent = area.replace(' Retail', '').replace('-retail', '');
-      pill.onclick = () => toggleDashboardFilter('salesArea', area);
-      areaContainer.appendChild(pill);
+  if (!dashFiltersBound) {
+    dashFiltersBound = true;
+    DASH_FILTERS.forEach(cfg => {
+      const sel = document.getElementById(cfg.id);
+      if (!sel) return;
+      sel.addEventListener('change', () => {
+        const vals = window.MS ? MS.vals(sel) : (sel.value ? [sel.value] : []);
+        dashboardFilters[cfg.key] = vals.length ? vals : null;
+        applyDashboardFilters();
+      });
     });
   }
 
-  // 2. EOs
-  const eoContainer = document.getElementById('dash-filter-eos');
-  if (eoContainer) {
-    eoContainer.innerHTML = '';
-    uniqueEos.forEach(eo => {
-      const pill = document.createElement('button');
-      pill.className = 'filter-pill' + (dfHas('eoName', eo) ? ' active' : '');
-      pill.textContent = eo.split(' ')[0];
-      pill.onclick = () => toggleDashboardFilter('eoName', eo);
-      eoContainer.appendChild(pill);
-    });
-  }
-
-  // 3. Vendors
-  const vendorContainer = document.getElementById('dash-filter-vendors');
-  if (vendorContainer) {
-    vendorContainer.innerHTML = '';
-    uniqueVendors.forEach(vendor => {
-      const pill = document.createElement('button');
-      pill.className = 'filter-pill' + (dfHas('vendor', vendor) ? ' active' : '');
-      pill.textContent = vendor;
-      pill.onclick = () => toggleDashboardFilter('vendor', vendor);
-      vendorContainer.appendChild(pill);
-    });
-  }
-
-  // 4. Status
-  const statusContainer = document.getElementById('dash-filter-status');
-  if (statusContainer) {
-    statusContainer.innerHTML = '';
-    uniqueStatuses.forEach(status => {
-      const pill = document.createElement('button');
-      pill.className = 'filter-pill' + (dfHas('status', status) ? ' active' : '');
-      pill.textContent = status;
-      pill.onclick = () => toggleDashboardFilter('status', status);
-      statusContainer.appendChild(pill);
-    });
-  }
-
-  // 5. Technology (IOT/WFCC)
-  const techContainer = document.getElementById('dash-filter-technology');
-  if (techContainer) {
-    techContainer.innerHTML = '';
-    const techs = ["IOT", "WFCC"];
-    techs.forEach(tech => {
-      const pill = document.createElement('button');
-      pill.className = 'filter-pill' + (dfHas('technology', tech) ? ' active' : '');
-      pill.textContent = tech;
-      pill.onclick = () => toggleDashboardFilter('technology', tech);
-      techContainer.appendChild(pill);
-    });
-  }
-
-  // Show/hide reset button
+  // Active-filter count + clear button
+  const active = DASH_FILTERS.reduce((n, cfg) => n + dfArr(cfg.key).length, 0) + (window.GlobalScope ? GlobalScope.get().length : 0);
   const resetBtn = document.getElementById('filter-reset-global-btn');
-  if (resetBtn) {
-    const hasActiveFilter = ['salesArea', 'eoName', 'vendor', 'status', 'technology'].some(k => dfArr(k).length);
-    resetBtn.style.display = hasActiveFilter ? 'block' : 'none';
-  }
+  if (resetBtn) resetBtn.style.display = active ? 'inline-flex' : 'none';
+  const cnt = document.getElementById('dash-filter-count');
+  if (cnt) { cnt.hidden = !active; cnt.textContent = active ? active + ' active' : ''; }
 }
 
 function toggleDashboardFilter(filterKey, value) {
@@ -1314,6 +1316,8 @@ function resetGlobalDashboardFilters() {
     status: null,
     technology: null
   };
+  // "Clear filters" also clears the territory (which refreshes every menu)
+  if (window.GlobalScope && GlobalScope.active()) { GlobalScope.set([]); return; }
   applyDashboardFilters();
 }
 
@@ -1377,6 +1381,8 @@ function updateOverviewCharts() {
           const value = dataset.data[index];
           if (value === null || value === undefined || Number(value) === 0) return;
           const label = fmt(value);
+          const bg = String(Array.isArray(dataset.backgroundColor) ? dataset.backgroundColor[index] : dataset.backgroundColor || '').toLowerCase();
+          const inside = /^#(fcb813|f07a5a)$/.test(bg) ? '#1b365d' : '#ffffff';
           ctx.save();
           ctx.font = '700 11px Inter, system-ui, sans-serif';
           const textW = ctx.measureText(label).width;
@@ -1385,7 +1391,7 @@ function updateOverviewCharts() {
           if (horizontal) {
             const barLen = Math.abs(bar.x - bar.base);
             if (barLen >= textW + 14) {
-              ctx.fillStyle = '#ffffff';
+              ctx.fillStyle = inside;
               ctx.textAlign = 'right';
               ctx.fillText(label, bar.x - 7, bar.y);
             } else {
@@ -1398,7 +1404,7 @@ function updateOverviewCharts() {
             ctx.translate(bar.x, bar.y);
             ctx.rotate(-Math.PI / 2);
             if (barH >= textW + 12) {
-              ctx.fillStyle = '#ffffff';
+              ctx.fillStyle = inside;
               ctx.textAlign = 'right';
               ctx.fillText(label, -6, 0);
             } else {
@@ -1454,7 +1460,7 @@ function updateOverviewCharts() {
         labels: ['Online', 'Partial', 'Offline'],
         datasets: [{
           data: [overallMetrics.fullyOnline, overallMetrics.partiallyOnline, overallMetrics.offline],
-          backgroundColor: ['#138a4a', '#e9a100', '#c8322b'],
+          backgroundColor: ['#138a4a', '#fcb813', '#c8322b'],   // online (green) · partial (yellow) · offline (red)
           borderWidth: 2,
           borderColor: '#ffffff'
         }]
@@ -1509,7 +1515,7 @@ function updateOverviewCharts() {
           {
             label: 'Uptime %',
             data: salesAreaUptimeVals,
-            backgroundColor: '#1a6bc8',
+            backgroundColor: '#1b365d',   // deep navy
             borderRadius: 4,
             barThickness: 18
           }
@@ -1550,9 +1556,11 @@ function updateOverviewCharts() {
       equipmentCompChartInstance.destroy();
     }
     
-    const salesAreaLabels = salesAreaSummary.map(s => s.key.replace(' Retail', '').replace('-retail', ''));
-    const mpdUptimeVals = salesAreaSummary.map(s => (s.mpdUptime * 100).toFixed(1));
-    const tankUptimeVals = salesAreaSummary.map(s => (s.tankUptime * 100).toFixed(1));
+    // Cap chart bars to top 15 to prevent mobile canvas memory crashes
+    const chartSalesAreas = salesAreaSummary.slice(0, 15);
+    const salesAreaLabels = chartSalesAreas.map(s => s.key.replace(' Retail', '').replace('-retail', ''));
+    const mpdUptimeVals = chartSalesAreas.map(s => (s.mpdUptime * 100).toFixed(1));
+    const tankUptimeVals = chartSalesAreas.map(s => (s.tankUptime * 100).toFixed(1));
     
     equipmentCompChartInstance = new Chart(equipCtx, {
       type: 'bar',
@@ -1563,8 +1571,8 @@ function updateOverviewCharts() {
           {
             label: 'MPD Uptime',
             data: mpdUptimeVals,
-            backgroundColor: '#003f87',
-            borderRadius: 3,
+            backgroundColor: '#1b365d',   // deep navy
+            borderRadius: 6,
             maxBarThickness: 14,
             categoryPercentage: 0.92,
             barPercentage: 0.62
@@ -1572,8 +1580,8 @@ function updateOverviewCharts() {
           {
             label: 'Tank Uptime',
             data: tankUptimeVals,
-            backgroundColor: '#0f8b82',
-            borderRadius: 3,
+            backgroundColor: '#f07a5a',   // coral
+            borderRadius: 6,
             maxBarThickness: 14,
             categoryPercentage: 0.92,
             barPercentage: 0.62
@@ -1619,8 +1627,9 @@ function updateOverviewCharts() {
       eoHorizontalChartInstance.destroy();
     }
     
-    const eoLabels = eoSummary.map(e => e.key);
-    const eoVals = eoSummary.map(e => (e.uptime * 100).toFixed(1));
+    const chartEos = eoSummary.slice(0, 15);
+    const eoLabels = chartEos.map(e => e.key);
+    const eoVals = chartEos.map(e => (e.uptime * 100).toFixed(1));
     
     eoHorizontalChartInstance = new Chart(eoCtx, {
       type: 'bar',
@@ -1630,7 +1639,7 @@ function updateOverviewCharts() {
         datasets: [{
           label: 'Uptime %',
           data: eoVals,
-          backgroundColor: '#1a6bc8',
+          backgroundColor: '#1b365d',   // deep navy
           borderRadius: 4,
           barThickness: 18
         }]
@@ -1668,7 +1677,7 @@ function updateOverviewCharts() {
       soHorizontalChartInstance.destroy();
     }
     
-    const sortedSoSummary = [...soSummary].sort((a, b) => b.uptime - a.uptime);
+    const sortedSoSummary = [...soSummary].sort((a, b) => b.uptime - a.uptime).slice(0, 15);
     const soLabels = sortedSoSummary.map(s => s.key);
     const soVals = sortedSoSummary.map(s => (s.uptime * 100).toFixed(1));
     
@@ -1680,7 +1689,7 @@ function updateOverviewCharts() {
         datasets: [{
           label: 'Uptime %',
           data: soVals,
-          backgroundColor: '#1a6bc8',
+          backgroundColor: '#1b365d',   // deep navy
           borderRadius: 4,
           barThickness: 10
         }]
@@ -1755,12 +1764,52 @@ function renderEOTable() {
 }
 
 // Render SO Table
+// Territory Summary (menu formerly "SO Summary"): one row per territory.
+// Compares every territory in the data — the global Territory filter only
+// highlights the chosen one — ranked by AVG uptime, with an all-territory total.
+window.territorySummary = [];
+window.territorySummaryTotal = null;
+function computeTerritorySummary() {
+  const src = (Array.isArray(window.__unscopedROs) && window.__unscopedROs.length) ? window.__unscopedROs : calculatedROs;
+  const map = {};
+  const total = createAggregateObj('All Territories');
+  src.forEach(ro => {
+    const k = String(ro.territory || '').trim() || 'Unmapped';
+    if (!map[k]) map[k] = createAggregateObj(k);
+    updateAggregateObj(map[k], ro);
+    updateAggregateObj(total, ro);
+  });
+  const list = Object.values(map).map(finalizeAggregate)
+    .sort((a, b) => (a.key === 'Unmapped') - (b.key === 'Unmapped') || b.uptime - a.uptime || b.totalROs - a.totalROs || a.key.localeCompare(b.key));
+  list.forEach((r, i) => { r.rank = i + 1; });
+  window.territorySummary = list;
+  window.territorySummaryTotal = finalizeAggregate(total);
+  return list;
+}
 function renderSOTable() {
   const tbody = document.getElementById('so-tbody');
+  if (!tbody) return;
   tbody.innerHTML = '';
-  soSummary.forEach(row => {
-    tbody.appendChild(createSummaryRowHtml(row, row.key));
+  const list = computeTerritorySummary();
+  const sel = window.GlobalScope ? GlobalScope.get() : [];
+  list.forEach(row => {
+    const tr = createSummaryRowHtml(row, row.key);
+    const td = document.createElement('td');
+    td.className = 'ts-rank';
+    td.textContent = row.rank;
+    tr.insertBefore(td, tr.firstChild);
+    if (sel.includes(row.key)) tr.classList.add('ts-selected');
+    tbody.appendChild(tr);
   });
+  if (list.length > 1) {
+    const tr = createSummaryRowHtml(window.territorySummaryTotal, 'All Territories', true);
+    tr.insertBefore(document.createElement('td'), tr.firstChild);
+    tbody.appendChild(tr);
+  }
+  const note = document.getElementById('territory-summary-note');
+  if (note) note.textContent = list.length
+    ? `${list.length} territor${list.length === 1 ? 'y' : 'ies'} · ranked by AVG uptime` + (sel.length ? ' · your territory highlighted' : '')
+    : 'No data loaded yet';
 }
 
 // Render Vendor Table
@@ -1881,12 +1930,13 @@ function sortROs() {
     let valB = key === 'new_logic_status' ? (b.new_logic_status || b.ro_online_status || b.status || '') : b[key];
     
     // Numeric conversions
+    if (key === 'sales_area') { const c = compareBySalesArea(a, b); return asc ? c : -c; }
     if (typeof valA === 'string' && !isNaN(valA) && valA !== "") valA = parseFloat(valA);
     if (typeof valB === 'string' && !isNaN(valB) && valB !== "") valB = parseFloat(valB);
     
     if (valA < valB) return asc ? -1 : 1;
     if (valA > valB) return asc ? 1 : -1;
-    return 0;
+    return compareBySalesArea(a, b);
   });
 }
 
@@ -2881,10 +2931,21 @@ window.renderDayMonitoringTable = function() {
   window.dayMonitoringFilteredList = list;
   if (list.length === 0) {
     tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; padding: 2rem;">No matching offline or partially online outlets.</td></tr>`;
+    const pEl = document.getElementById('day-monitoring-pagination');
+    if (pEl) pEl.style.display = 'none';
     return;
   }
 
-  list.forEach(ro => {
+  // Pagination for Day Monitoring to prevent mobile browser crash
+  const DM_PAGE_SIZE = 40;
+  let page = window._dmPage || 1;
+  const totalPages = Math.max(1, Math.ceil(list.length / DM_PAGE_SIZE));
+  if (page > totalPages) page = 1;
+  window._dmPage = page;
+  const startIdx = (page - 1) * DM_PAGE_SIZE;
+  const pagedList = list.slice(startIdx, startIdx + DM_PAGE_SIZE);
+
+  pagedList.forEach(ro => {
     const tr = document.createElement('tr');
     
     // Shared cloud values are preferred; localStorage remains an offline fallback.
@@ -3011,6 +3072,41 @@ window.renderDayMonitoringTable = function() {
 
     tbody.appendChild(tr);
   });
+
+  // Responsive pagination bar for Day Monitoring
+  let paginEl = document.getElementById('day-monitoring-pagination');
+  const tableCard = document.querySelector('#tab-day-monitoring .table-card') || (tbody.closest ? tbody.closest('.table-card') : null);
+  if (!paginEl && tableCard) {
+    paginEl = document.createElement('div');
+    paginEl.id = 'day-monitoring-pagination';
+    tableCard.appendChild(paginEl);
+  }
+  if (paginEl) {
+    if (totalPages <= 1) {
+      paginEl.style.display = 'none';
+      paginEl.innerHTML = '';
+    } else {
+      paginEl.style.display = 'flex';
+      paginEl.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:12px 18px; margin:10px 1.5rem 1rem; background:var(--card-bg, #fff); border-radius:10px; border:1px solid var(--border-color, #e2e8f0); flex-wrap:wrap; gap:10px; font-size:13px;';
+      paginEl.innerHTML = `
+        <span style="font-weight:600; color:var(--text-muted, #64748b);">
+          Showing ${startIdx + 1}–${Math.min(startIdx + DM_PAGE_SIZE, list.length)} of <b>${list.length.toLocaleString()}</b> outlets (Page <b>${page}</b> of <b>${totalPages}</b>)
+        </span>
+        <div style="display:flex; gap:8px;">
+          <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page > 1 ? 'pointer' : 'not-allowed'}; opacity:${page > 1 ? '1' : '0.4'};" onclick="window.dmNavPage(-1)">← Previous</button>
+          <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page < totalPages ? 'pointer' : 'not-allowed'}; opacity:${page < totalPages ? '1' : '0.4'};" onclick="window.dmNavPage(1)">Next →</button>
+        </div>
+      `;
+    }
+  }
+};
+
+window.dmNavPage = function(delta) {
+  const cur = window._dmPage || 1;
+  window._dmPage = Math.max(1, cur + delta);
+  if (window.renderDayMonitoringTable) window.renderDayMonitoringTable();
+  const target = document.getElementById('tab-day-monitoring');
+  if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
 };
 
 window.exportDayMonitoringData = function() {
@@ -3936,10 +4032,21 @@ window.renderMonitoringComparison = async function() {
   
   if (compareList.length === 0) {
     tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; padding: 2rem;">No matching status changes found.</td></tr>`;
+    const pEl = document.getElementById('mon-comparison-pagination');
+    if (pEl) pEl.style.display = 'none';
     return;
   }
   
-  compareList.forEach(ro => {
+  // Pagination for Monitoring Comparison to prevent mobile browser crash
+  const MON_PAGE_SIZE = 40;
+  let monPage = window._monPage || 1;
+  const totalMonPages = Math.max(1, Math.ceil(compareList.length / MON_PAGE_SIZE));
+  if (monPage > totalMonPages) monPage = 1;
+  window._monPage = monPage;
+  const monStartIdx = (monPage - 1) * MON_PAGE_SIZE;
+  const pagedCompareList = compareList.slice(monStartIdx, monStartIdx + MON_PAGE_SIZE);
+
+  pagedCompareList.forEach(ro => {
     const baseStatus = baselineStatusMap[ro.roid] || 'Offline';
     const currStatus = ro.status;
     
@@ -3979,6 +4086,41 @@ window.renderMonitoringComparison = async function() {
     `;
     tbody.appendChild(tr);
   });
+
+  // Responsive pagination bar for Monitoring Comparison
+  let monPaginEl = document.getElementById('mon-comparison-pagination');
+  const monTableCard = document.querySelector('#tab-monitoring .table-card') || (tbody.closest ? tbody.closest('.table-card') : null);
+  if (!monPaginEl && monTableCard) {
+    monPaginEl = document.createElement('div');
+    monPaginEl.id = 'mon-comparison-pagination';
+    monTableCard.appendChild(monPaginEl);
+  }
+  if (monPaginEl) {
+    if (totalMonPages <= 1) {
+      monPaginEl.style.display = 'none';
+      monPaginEl.innerHTML = '';
+    } else {
+      monPaginEl.style.display = 'flex';
+      monPaginEl.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:12px 18px; margin:10px 1.5rem 1rem; background:var(--card-bg, #fff); border-radius:10px; border:1px solid var(--border-color, #e2e8f0); flex-wrap:wrap; gap:10px; font-size:13px;';
+      monPaginEl.innerHTML = `
+        <span style="font-weight:600; color:var(--text-muted, #64748b);">
+          Showing ${monStartIdx + 1}–${Math.min(monStartIdx + MON_PAGE_SIZE, compareList.length)} of <b>${compareList.length.toLocaleString()}</b> outlets (Page <b>${monPage}</b> of <b>${totalMonPages}</b>)
+        </span>
+        <div style="display:flex; gap:8px;">
+          <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${monPage > 1 ? 'pointer' : 'not-allowed'}; opacity:${monPage > 1 ? '1' : '0.4'};" onclick="window.monNavPage(-1)">← Previous</button>
+          <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${monPage < totalMonPages ? 'pointer' : 'not-allowed'}; opacity:${monPage < totalMonPages ? '1' : '0.4'};" onclick="window.monNavPage(1)">Next →</button>
+        </div>
+      `;
+    }
+  }
+};
+
+window.monNavPage = function(delta) {
+  const cur = window._monPage || 1;
+  window._monPage = Math.max(1, cur + delta);
+  if (window.renderMonitoringComparison) window.renderMonitoringComparison();
+  const target = document.getElementById('tab-monitoring');
+  if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
 };
 
 window.setupMonitoringListeners = function() {
@@ -4064,179 +4206,305 @@ window.setupMonitoringListeners = function() {
 };
 
 // Sync live day monitoring data from Google Sheet
-window.syncGoogleSheet = async function(silent = false) {
-  if (!silent) showToast("Fetching day monitoring data from Google Sheet...", "info");
-  try {
-    let configuredUrl = localStorage.getItem('bpcl_google_sheet_url') || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3EE_SNele4ucfWLc38wDtMaSB18jj2OgCw-Ze8D76Xt5657yylbThfpJ3GF9_9-I6bCcudKh4z42o/pub?output=xlsx';
-    
-    // Auto-convert standard edit URL to XLSX export URL
-    let targetUrl = configuredUrl.trim();
-    if (targetUrl.includes('docs.google.com/spreadsheets') && !targetUrl.includes('/export') && !targetUrl.includes('/pub')) {
-      if (targetUrl.includes('/edit')) {
-        targetUrl = targetUrl.replace(/\/edit.*$/, '/export?format=xlsx');
-      } else {
-        if (!targetUrl.endsWith('/')) targetUrl += '/';
-        targetUrl += 'export?format=xlsx';
-      }
-    } else if (targetUrl.includes('pub?output=csv')) {
-      targetUrl = targetUrl.replace('pub?output=csv', 'pub?output=xlsx');
-    }
-    
-    console.log("Syncing from target URL:", targetUrl);
-    const response = await fetch(targetUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch Google Sheet (${response.status}). Please make sure you published to web, or shared as "Anyone with the link can view".`);
-    }
-    
-    const arrayBuffer = await response.arrayBuffer();
-    const data = new Uint8Array(arrayBuffer);
-    const workbook = XLSX.read(data, {type: 'array'});
-    
-    // Process mappings sheet if exists
-    if (workbook.SheetNames.includes('TE-SO Map')) {
-      parseMappingsFromSheet(workbook.Sheets['TE-SO Map']);
-    } else if (workbook.SheetNames.includes('EO-SO Map')) {
-      parseMappingsFromSheet(workbook.Sheets['EO-SO Map']);
-    }
-    
-    // Process HistoryArchive if exists
-    if (workbook.SheetNames.includes('HistoryArchive')) {
-      try {
-        const historySheet = workbook.Sheets['HistoryArchive'];
-        const historyRows = XLSX.utils.sheet_to_json(historySheet);
-        if (historyRows && historyRows.length > 0) {
-          for (const row of historyRows) {
-            const idVal = parseInt(row.ID || row.id || row.Timestamp || row.timestamp);
-            if (isNaN(idVal)) continue;
-            
-            let metricsVal = {};
-            try {
-              metricsVal = typeof row.MetricsJSON === 'string' ? JSON.parse(row.MetricsJSON) : (row.MetricsJSON || {});
-            } catch(e) {
-              console.error("Error parsing metrics JSON", e);
-            }
-            
-            let statusMapVal = {};
-            try {
-              statusMapVal = typeof row.StatusMapJSON === 'string' ? JSON.parse(row.StatusMapJSON) : (row.StatusMapJSON || {});
-            } catch(e) {
-              console.error("Error parsing status map JSON", e);
-            }
-            
-            const rawDataList = [];
-            Object.keys(statusMapVal).forEach(roid => {
-              rawDataList.push({
-                roid: roid,
-                status: statusMapVal[roid]
-              });
-            });
-            
-            const record = {
-              id: idVal,
-              timestamp: idVal,
-              date: String(row.Date || row.date || ''),
-              time: String(row.Time || row.time || ''),
-              filename: String(row.Filename || row.filename || ''),
-              metrics: metricsVal,
-              rawData: rawDataList,
-              googleDriveFileId: String(row.GoogleDriveFileId || row.googledrivefileid || '')
-            };
-            
-            await DB.saveRecord(record);
-          }
-        }
-      } catch(e) {
-        console.error("Error parsing HistoryArchive sheet", e);
-      }
-    }
-    
-    let rawDataSheetName = null;
-    if (workbook.SheetNames.includes('Raw Data')) {
-      rawDataSheetName = 'Raw Data';
-    } else {
-      rawDataSheetName = workbook.SheetNames.find(name => name.toLowerCase().includes('raw'));
-    }
-    
-    if (!rawDataSheetName) {
-      rawDataSheetName = workbook.SheetNames.find(name => {
-        const ln = name.toLowerCase();
-        return ln.includes('charger') || ln.includes('list') || ln.includes('data') || ln.includes('status');
-      });
-    }
-    
-    if (!rawDataSheetName) {
-      rawDataSheetName = workbook.SheetNames[0];
-    }
-    
-    const sheet = workbook.Sheets[rawDataSheetName];
-    const parsedData = XLSX.utils.sheet_to_json(sheet, {header: 1});
-    
-    if (parsedData.length < 3) {
-      throw new Error("Invalid sheet structure: not enough rows in Google Sheet.");
-    }
-    
-    // Parse raw rows
-    parseRawData(parsedData);
-    
-    // Recalculate metrics
-    recalculateAndRefresh();
-    
-    // Load today's shared Dependency/Remark values after the latest status data is ready.
-    await window.loadSharedDayMonitoring(true);
+// --------------------------------------------------------------------------
+// Google Sheet sync — one workbook feeds the whole app:
+//   Sheet 1  uptime monitoring ("Raw Data")        → every automation menu
+//   + "Last updated stock" / "Stock hourly" / "Onboarded tanks" → RO-Wise Tank Stock
+//   + optional "TE-SO Map" and "HistoryArchive"
+// The workbook is read in a background worker (no page freeze). If the sheet has
+// not changed since the last sync, nothing is re-processed.
+// --------------------------------------------------------------------------
+window.__sheetSync = { fp: null, at: 0, busy: null, tankFound: false };
 
-    // Construct current timestamp
-    const now = new Date();
-    const dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
-    const timeStr = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
-    const timestamp = now.getTime();
-    
-    // Save to IndexedDB history
-    if (!DB.db) {
-      await DB.open();
-    }
-    
-    const record = {
-      id: timestamp,
-      timestamp: timestamp,
-      date: dateStr,
-      time: timeStr,
-      filename: "Google_Sheet_Live_Sync.xlsx",
-      metrics: Object.assign({}, window.overallMetrics),
-      rawData: JSON.parse(JSON.stringify(window.rawDataRows)),
-      fileBlob: new Blob([arrayBuffer], {type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
-    };
-    
-    await DB.saveRecord(record);
-    
-    // Update trend log history if on Performance tab
-    if (typeof loadUploadHistory === 'function') {
-      await loadUploadHistory();
-    }
-    
-    // Switch views
-    document.getElementById('upload-landing-view').style.display = 'none';
-    document.getElementById('dashboard-active-view').style.display = 'flex';
-    
-    // Show header elements
-    document.getElementById('file-meta').textContent = `Loaded: Google Sheet Live Sync (${rawDataRows.length} rows)`;
-    document.getElementById('file-meta').style.display = 'block';
-    document.getElementById('header-upload-wrapper').style.display = 'block';
-    
-    // Show Sync Sheet and Configure Link in header
-    document.getElementById('btn-sync-sheet').style.display = 'inline-flex';
-    document.getElementById('link-setup-sheet').style.display = 'inline-block';
-    
-    if (!silent) showToast(`Successfully synced Google Sheet with ${rawDataRows.length} outlets!`, "success");
-    
-  } catch (error) {
-    console.error("Google Sheet Sync Error:", error);
-    if (!silent) {
-      showToast(error.message || "Failed to sync Google Sheet. Verify sharing settings.", "error");
+function resolveSheetExportUrl() {
+  const OFFICIAL_URL = 'https://docs.google.com/spreadsheets/d/14KDPhrCgKmZzLKNzSdS6YtPIeXdDtlXPbbPWMVxFA5I/export?format=xlsx';
+  let configuredUrl = localStorage.getItem('bpcl_google_sheet_url');
+  if (!configuredUrl || configuredUrl.includes('2PACX-1vS3EE_SNele4ucfWLc38wDtMaSB18jj2OgCw')) {
+    configuredUrl = OFFICIAL_URL;
+    localStorage.setItem('bpcl_google_sheet_url', OFFICIAL_URL);
+  }
+  let targetUrl = configuredUrl.trim();
+  if (targetUrl.includes('docs.google.com/spreadsheets') && !targetUrl.includes('/export') && !targetUrl.includes('/pub')) {
+    if (targetUrl.includes('/edit')) {
+      targetUrl = targetUrl.replace(/\/edit.*$/, '/export?format=xlsx');
     } else {
-      throw error;
+      if (!targetUrl.endsWith('/')) targetUrl += '/';
+      targetUrl += 'export?format=xlsx';
     }
+  } else if (targetUrl.includes('pub?output=csv')) {
+    targetUrl = targetUrl.replace('pub?output=csv', 'pub?output=xlsx');
+  }
+  return targetUrl;
+}
+window.resolveSheetExportUrl = resolveSheetExportUrl;
+
+function pickUptimeSheet(book) {
+  const candidates = book.sheets.filter(s => s.kind === 'other');
+  const exact = candidates.find(s => s.name.trim().toLowerCase() === 'raw data');
+  if (exact) return exact.name;
+  const named = candidates.find(s => /raw|uptime|automation/i.test(s.name));
+  if (named) return named.name;
+  const generic = candidates.find(s => /charger|list|data|status/i.test(s.name));
+  if (generic) return generic.name;
+  return candidates.length ? candidates[0].name : null; // Sheet 1 = uptime monitoring
+}
+
+async function importHistoryArchive(aoa) {
+  const rows = WorkbookReader.aoaToObjects(aoa);
+  if (!rows.length) return 0;
+  if (!DB.db) await DB.open();
+  const existing = new Set((await DB.getAllRecords()).map(r => r.id));
+  let added = 0;
+  for (const row of rows) {
+    const idVal = parseInt(row.ID || row.id || row.Timestamp || row.timestamp);
+    if (isNaN(idVal) || existing.has(idVal)) continue; // never overwrite a full local snapshot
+    let metricsVal = {}, statusMapVal = {};
+    try { metricsVal = typeof row.MetricsJSON === 'string' ? JSON.parse(row.MetricsJSON) : (row.MetricsJSON || {}); } catch (e) { /* ignore */ }
+    try { statusMapVal = typeof row.StatusMapJSON === 'string' ? JSON.parse(row.StatusMapJSON) : (row.StatusMapJSON || {}); } catch (e) { /* ignore */ }
+    const rawDataList = Object.keys(statusMapVal).map(roid => ({ roid, status: statusMapVal[roid] }));
+    await DB.saveRecord({
+      id: idVal, timestamp: idVal,
+      date: String(row.Date || row.date || ''),
+      time: String(row.Time || row.time || ''),
+      filename: String(row.Filename || row.filename || ''),
+      metrics: metricsVal, rawData: rawDataList,
+      googleDriveFileId: String(row.GoogleDriveFileId || row.googledrivefileid || '')
+    });
+    added++;
+  }
+  return added;
+}
+
+function rowsFingerprint(rows) {
+  const str = JSON.stringify(rows);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return str.length + ':' + (h >>> 0).toString(16);
+}
+
+// ---------------------------------------------------------------------------
+// Speed-ups
+//  1. The last downloaded workbook is kept on this device (IndexedDB), so the
+//     app opens instantly with it and refreshes from Google in the background.
+//  2. Before downloading the whole workbook, the tiny "Last Updated" tab is
+//     read on its own; if it has not changed, the big download is skipped.
+// ---------------------------------------------------------------------------
+const SheetCache = {
+  KEY: 'sheet_workbook_cache',
+  async load() {
+    try { if (!DB.db) await DB.open(); return await DB.get('config', this.KEY); } catch (e) { return null; }
+  },
+  async save(buf, fp, stamp) {
+    try { if (!DB.db) await DB.open(); await DB.set('config', this.KEY, { buf, fp, stamp: stamp || null, at: Date.now() }); }
+    catch (e) { console.warn('[SheetCache] not saved', e); }
   }
 };
+window.SheetCache = SheetCache;
+
+function markSheetLive() {
+  const meta = document.getElementById('file-meta');
+  if (meta && Array.isArray(window.rawDataRows) && rawDataRows.length) meta.textContent = `Loaded: Google Sheet Live Sync (${rawDataRows.length} rows)`;
+}
+
+function sheetIdFromUrl(u) { const m = String(u || '').match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/); return m ? m[1] : null; }
+
+/** Contents of the "Last Updated" tab (a few hundred bytes), or null if not available. */
+async function fetchSheetStamp() {
+  const id = sheetIdFromUrl(resolveSheetExportUrl());
+  if (!id) return null;
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const t = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+  try {
+    const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent('Last Updated')}&_=${Date.now()}`;
+    const res = await fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+    if (!res.ok) return null;
+    const txt = (await res.text()).trim();
+    // must really be the Last Updated tab (Google returns the first tab if the name is unknown)
+    return /updated\s*\(iso\)/i.test(txt.split('\n')[0] || '') ? txt : null;
+  } catch (e) { return null; } finally { if (t) clearTimeout(t); }
+}
+
+/** Shared pipeline: workbook bytes → every menu. Used for live sync and for the saved copy. */
+async function processSheetWorkbook(arrayBuffer, fp, ctx) {
+  // Two-stage read: uptime first (fast), tank sheets afterwards in the background
+  let firstReady;
+  const first = new Promise(r => { firstReady = r; });
+  const all = WorkbookReader.read(arrayBuffer, { onStage1: b => firstReady(b) });
+  const book = await Promise.race([first, all]);
+  if (window.TankStock) window.TankStock.markLoading();
+
+  const mapAoa = book.byKind('mapping');
+  if (mapAoa) parseMappingsFromSheet(mapAoa);
+
+  // History archive: only re-import when that tab actually changed
+  const histAoa = book.byKind('history');
+  if (histAoa && histAoa.length > 1) {
+    const last = histAoa[histAoa.length - 1] || [];
+    const sig = histAoa.length + ':' + String(last[0] ?? '') + ':' + String(last[1] ?? '');
+    if (localStorage.getItem('bpcl_hist_sig') !== sig) {
+      try { await importHistoryArchive(histAoa); localStorage.setItem('bpcl_hist_sig', sig); }
+      catch (e) { console.error('HistoryArchive import failed', e); }
+    }
+  }
+
+  const uptimeName = pickUptimeSheet(book);
+  const parsedData = uptimeName ? book.rows[uptimeName] : null;
+  if (!parsedData || parsedData.length < 3) {
+    throw new Error("Invalid sheet structure: the uptime sheet (Sheet 1 / 'Raw Data') has no data.");
+  }
+  parseRawData(parsedData);
+  if (window.DataFreshness) DataFreshness.fromWorkbook(book);
+  recalculateAndRefresh();
+  // shared Day Monitoring remarks load on their own — the screen does not wait for them
+  if (window.loadSharedDayMonitoring) window.loadSharedDayMonitoring(true).catch(() => {});
+
+  window.__sheetSync.fp = fp;
+  window.__sheetSync.at = Date.now();
+
+  all.then(full => {
+    const tank = { latest: full.byKind('tank_latest'), hourly: full.byKind('tank_hourly'), onboarded: full.byKind('tank_onboarded') };
+    window.__sheetSync.tankFound = !!(tank.latest || tank.hourly || tank.onboarded);
+    if (window.TankStock) {
+      window.TankStock.ingestSheets(tank);
+      window.TankStock.markSynced(window.__sheetSync.at, window.__sheetSync.tankFound);
+    }
+  }).catch(err => {
+    console.error('Tank sheets could not be read', err);
+    if (window.TankStock) window.TankStock.markSyncError(err.message);
+  });
+
+  document.getElementById('upload-landing-view').style.display = 'none';
+  document.getElementById('dashboard-active-view').style.display = 'flex';
+  const meta = document.getElementById('file-meta');
+  if (meta) { meta.textContent = `Loaded: Google Sheet${ctx.fromCache ? ' (saved copy, updating…)' : ' Live Sync'} (${rawDataRows.length} rows)`; meta.style.display = 'block'; }
+  const btnSync = document.getElementById('btn-sync-sheet');
+  if (btnSync) btnSync.style.display = 'inline-flex';
+
+  if (ctx.fromCache) return;
+
+  // History snapshot — only when the uptime data changed (reads just the newest record)
+  const now = new Date();
+  const dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  const timeStr = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  if (!DB.db) await DB.open();
+  const dataFp = rowsFingerprint(window.rawDataRows);
+  const latest = DB.getLatestRecord ? await DB.getLatestRecord() : (await DB.getAllRecords())[0];
+  if (!latest || latest.dataFp !== dataFp || latest.date !== dateStr) {
+    const compactRaw = (window.rawDataRows || []).map(r => ({
+      roid: r.roid, outlet_name: r.outlet_name, sales_area: r.sales_area, territory: r.territory, vendor: r.vendor,
+      onb_mpd: r.onb_mpd, onl_mpd: r.onl_mpd, onb_tnk: r.onb_tnk, onl_tnk: r.onl_tnk,
+      status: r.status, ro_online_status: r.ro_online_status
+    }));
+    await DB.saveRecord({
+      id: now.getTime(), timestamp: now.getTime(), date: dateStr, time: timeStr,
+      filename: "Google_Sheet_Live_Sync.xlsx",
+      metrics: Object.assign({}, window.overallMetrics),
+      rawData: compactRaw, dataFp: dataFp
+    });
+  }
+  const trendOpen = document.getElementById('tab-performance-trend')?.classList.contains('active');
+  if (trendOpen && typeof loadUploadHistory === 'function') await loadUploadHistory();
+}
+
+/** Open instantly from the copy saved on this device. Returns true if shown. */
+window.loadFromSheetCache = async function () {
+  const c = await SheetCache.load();
+  if (!c || !c.buf || !c.buf.byteLength) return false;
+  try {
+    window.__sheetSync.stamp = c.stamp || null;
+    await processSheetWorkbook(c.buf.slice(0), c.fp, { fromCache: true });
+    console.log(`[SheetCache] opened saved copy from ${new Date(c.at).toLocaleString()}`);
+    return true;
+  } catch (e) {
+    console.warn('[SheetCache] saved copy unusable', e);
+    return false;
+  }
+};
+
+window.syncGoogleSheet = async function(silent = false, opts = {}) {
+  if (typeof silent !== 'boolean') silent = false;        // called straight from a click handler
+  if (window.__sheetSync.busy) return window.__sheetSync.busy;
+  const run = (async () => {
+    const btns = [document.getElementById('btn-sync-sheet'), document.getElementById('tsSyncBtn')].filter(Boolean);
+    const haveData = Array.isArray(window.rawDataRows) && window.rawDataRows.length > 0;
+    try {
+      // 1) Cheap check: has the "Last Updated" tab changed? (background refreshes only;
+      //    a manual Sync click downloads in parallel and never waits on this)
+      const stampP = fetchSheetStamp();
+      const stamp = silent ? await stampP : null;
+      if (silent && !opts.force && haveData && stamp && window.__sheetSync.stamp && stamp === window.__sheetSync.stamp) {
+        window.__sheetSync.at = Date.now();
+        markSheetLive();
+        if (window.DataFreshness) DataFreshness.sheetChecked();
+        if (window.TankStock) window.TankStock.markSynced(window.__sheetSync.at, window.__sheetSync.tankFound);
+        return;
+      }
+
+      if (!silent) showToast("Fetching the latest data from Google Sheet…", "info");
+      btns.forEach(b => b.classList.add('is-syncing'));
+      const response = await fetch(resolveSheetExportUrl(), { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch Google Sheet (${response.status}). Please make sure you published to web, or shared as "Anyone with the link can view".`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      const stampNow = silent ? stamp : await stampP;
+
+      // 2) Unchanged workbook → nothing to re-process
+      const fp = WorkbookReader.fingerprint(arrayBuffer);
+      if (!opts.force && fp === window.__sheetSync.fp && haveData) {
+        window.__sheetSync.at = Date.now();
+        window.__sheetSync.stamp = stampNow || window.__sheetSync.stamp;
+        markSheetLive();
+        if (window.DataFreshness) DataFreshness.sheetChecked();
+        if (window.TankStock) window.TankStock.markSynced(window.__sheetSync.at, window.__sheetSync.tankFound);
+        if (stampNow) SheetCache.load().then(c => { if (c && c.fp === fp && c.stamp !== stampNow) SheetCache.save(c.buf, fp, stampNow); });
+        if (!silent) showToast('Already up to date — no changes in the Google Sheet since the last sync.', 'success');
+        return;
+      }
+
+      // 3) Keep a copy on this device for instant start next time (the reader consumes the original)
+      SheetCache.save(arrayBuffer.slice(0), fp, stampNow);
+      window.__sheetSync.stamp = stampNow;
+      await processSheetWorkbook(arrayBuffer, fp, { fromCache: false });
+
+      if (!silent) {
+        const tankMsg = window.__sheetSync.tankFound ? ' + tank stock' : '';
+        showToast(`Synced Google Sheet: ${rawDataRows.length} outlets${tankMsg}`, "success");
+      }
+    } catch (error) {
+      console.error("Google Sheet Sync Error:", error);
+      if (window.TankStock) window.TankStock.markSyncError(error.message);
+      if (!silent) {
+        showToast(error.message || "Failed to sync Google Sheet. Verify sharing settings.", "error");
+      } else {
+        throw error;
+      }
+    } finally {
+      btns.forEach(b => b.classList.remove('is-syncing'));
+    }
+  })();
+  window.__sheetSync.busy = run;
+  try { return await run; } finally { window.__sheetSync.busy = null; }
+};
+
+// Auto-refresh: re-check the Google Sheet every few minutes while the page is open.
+// Unchanged sheets cost one download + a 10 ms check; changed sheets refresh every menu.
+(function setupSheetAutoRefresh() {
+  const minutes = () => Math.max(2, parseInt(localStorage.getItem('bpcl_sheet_autosync_min') || '5', 10) || 5);
+  let timer = null;
+  async function tick() {
+    if (document.visibilityState !== 'visible' || navigator.onLine === false) return;
+    if (!window.currentUser || window.dashboardMode === 'evcs') return;
+    if (!window.__sheetSync.at) return; // only after the first successful sync
+    try { await window.syncGoogleSheet(true); } catch (e) { console.warn('[AutoSync] skipped:', e.message); }
+  }
+  function start() { if (timer) clearInterval(timer); timer = setInterval(tick, minutes() * 60000); }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && window.__sheetSync.at && Date.now() - window.__sheetSync.at > minutes() * 60000) tick();
+  });
+  start();
+  window.setSheetAutoSyncMinutes = m => { localStorage.setItem('bpcl_sheet_autosync_min', String(m)); start(); };
+})();
 
 
 

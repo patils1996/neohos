@@ -31,6 +31,21 @@
   let selectedRO = null;
   let allRO = [];
   let fileTimestamps = {};
+  let source = '';          // 'sheet' | 'files' | ''
+  let lastSyncAt = 0;
+  let renderPending = false;
+
+  // Older versions copied the whole tank data into localStorage (slow, ~5 MB limit) — free that space
+  try { localStorage.removeItem('bpcl_tank_stock_cache'); localStorage.removeItem('bpcl_tank_mapping_v1'); } catch (e) { /* ignore */ }
+
+  function statusLine(label) {
+    return `<span class="ts-dot on"></span> ${esc(label)} · <b>${data.hourly.length.toLocaleString('en-IN')}</b> hourly rows · <b>${data.onboarded.length.toLocaleString('en-IN')}</b> tank mappings · <b>${data.latest.length.toLocaleString('en-IN')}</b> latest stock records`;
+  }
+  function isVisible() {
+    const tab = document.getElementById('tab-tank-stock');
+    return !tab || tab.classList.contains('active'); // standalone page has no tab → always visible
+  }
+  function hhmm(ts) { const d = new Date(ts); return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }); }
 
   // Scoped element selector to #tab-tank-stock to prevent collisions
   const $ = id => document.querySelector('#tab-tank-stock #' + id) || document.getElementById(id);
@@ -152,36 +167,26 @@
         if (!fileMap[name]) throw Error('Missing file: ' + name);
         parsed[FILES[name]] = await parseWorkbook(fileMap[name], FILES[name]);
       }
-      let cached = null;
-      try { cached = JSON.parse(localStorage.getItem('bpcl_tank_mapping_v1') || 'null'); } catch (e) {}
-      if (fileMap['Onboarded tanks.xlsx'] && (forceMapping || !cached)) {
+      if (fileMap['Onboarded tanks.xlsx']) {
         parsed.onboarded = await parseWorkbook(fileMap['Onboarded tanks.xlsx'], 'onboarded');
-        try { localStorage.setItem('bpcl_tank_mapping_v1', JSON.stringify(parsed.onboarded)); } catch (e) { console.warn('Tank mapping could not be cached', e); }
       } else {
-        parsed.onboarded = cached || data.onboarded || [];
+        parsed.onboarded = data.onboarded || [];
       }
       data.hourly = parsed.hourly;
       data.latest = parsed.latest;
       data.onboarded = parsed.onboarded;
 
-      try {
-        localStorage.setItem('bpcl_tank_stock_cache', JSON.stringify({
-          hourly: data.hourly,
-          latest: data.latest,
-          savedAt: Date.now()
-        }));
-      } catch (e) {}
-
+      source = 'files';
       renderDashboard();
+      notifyDashboard();
       if ($('dataStatus')) {
-        const driveLabel = folderHandle ? `<span class="ts-dot on"></span> Google Drive: <b>${esc(folderHandle.name || GDRIVE_CONFIG.folderName)}</b> · ` : '';
-        $('dataStatus').innerHTML = `${driveLabel}<b>${data.hourly.length.toLocaleString()}</b> hourly rows · <b>${data.onboarded.length.toLocaleString()}</b> tank mappings · <b>${data.latest.length.toLocaleString()}</b> latest stock records`;
+        $('dataStatus').innerHTML = statusLine('Excel files');
       }
       if ($('updatedAt')) {
         $('updatedAt').textContent = 'Stock refreshed at ' + new Date().toLocaleTimeString() + (forceMapping ? ' • Tank mapping updated' : '');
       }
       if (window.showToast) {
-        window.showToast(folderHandle ? 'Tank stock updated from Google Drive' : 'Tank stock loaded from Excel files', 'success');
+        window.showToast('Tank stock loaded from Excel files', 'success');
       }
     } catch (e) {
       if ($('dataStatus')) $('dataStatus').innerHTML = '<span class="error">' + e.message + '</span>';
@@ -325,12 +330,25 @@
   function groupByRO() {
     const m = new Map();
     const ensure = (id, row) => {
-      if (!m.has(id)) m.set(id, { id, name: row['Retail Outlet'] || row.RO_Name || 'Unknown RO', territory: row.Territory || '', area: row['Sales Area'] || row.Salesarea || '', vendor: row['RA Vendor'] || row.RA_Vendor || '', state: row.State || '', ebms: 0, hsd: 0, total: 0, tanks: [], latest: [], online: 0, offline: 0 });
+      if (!m.has(id)) {
+        // Territory / sales area come from the uptime sheet when the RO is there,
+        // so the territory filter matches the Dashboard and all other menus.
+        const up = window.__roLookup && window.__roLookup.get(String(id).replace(/\D/g, '').replace(/^0+/, ''));
+        m.set(id, { id, name: row['Retail Outlet'] || row.RO_Name || 'Unknown RO', territory: (up && up.territory) || row.Territory || '', area: (up && up.area) || row['Sales Area'] || row.Salesarea || '', vendor: row['RA Vendor'] || row.RA_Vendor || '', state: row.State || '', ebms: 0, hsd: 0, total: 0, capacity: 0, ebmsCap: 0, hsdCap: 0, tanks: [], latest: [], online: 0, offline: 0 });
+      }
       return m.get(id);
     };
     data.onboarded.forEach(r => {
       if (!r._ro) return;
       let x = ensure(r._ro, r);
+      if (!x.territory && (r.Territory || r.territory)) x.territory = r.Territory || r.territory;
+      if (!x.area && (r.Salesarea || r['Sales Area'] || r.sales_area)) x.area = r.Salesarea || r['Sales Area'] || r.sales_area;
+      if (!x.vendor && (r.RA_Vendor || r['RA Vendor'] || r.vendor)) x.vendor = r.RA_Vendor || r['RA Vendor'] || r.vendor;
+      if (!x.state && (r.State || r.state)) x.state = r.State || r.state;
+      let cap = num(r['On-Boarded Tankage (KL)'] ?? r['On-boarded Tankage']) || 0;
+      let pName = key(r.Product_Name || r['Product Name'] || '');
+      if (pName.includes('EBMS')) x.ebmsCap = Math.max(x.ebmsCap, cap);
+      else if (pName.includes('HSD')) x.hsdCap = Math.max(x.hsdCap, cap);
       x.tanks.push(r);
       let st = key(r.Status);
       if (st === 'ONLINE') x.online++;
@@ -339,98 +357,237 @@
     data.latest.forEach(r => {
       if (!r._ro) return;
       let x = ensure(r._ro, r);
+      if (!x.territory && (r.Territory || r.territory)) x.territory = r.Territory || r.territory;
+      if (!x.area && (r['Sales Area'] || r.Salesarea || r.sales_area)) x.area = r['Sales Area'] || r.Salesarea || r.sales_area;
+      if (!x.vendor && (r['RA Vendor'] || r.RA_Vendor || r.vendor)) x.vendor = r['RA Vendor'] || r.RA_Vendor || r.vendor;
+      if (!x.state && (r.State || r.state)) x.state = r.State || r.state;
       x.latest.push(r);
       let p = key(r['Product Name']);
       let stock = num(r.Stock) || 0;
-      if (p.includes('EBMS')) x.ebms += stock;
-      else if (p === 'HSD') x.hsd += stock;
+      let cap = num(r['On-boarded Tankage'] ?? r['On-Boarded Tankage'] ?? r['On-Boarded Tankage (KL)']) || 0;
+      if (p.includes('EBMS')) { x.ebms += stock; x.ebmsCap += cap; }
+      else if (p === 'HSD') { x.hsd += stock; x.hsdCap += cap; }
       x.total += stock;
+      x.capacity += cap;
     });
     data.hourly.forEach(r => {
       if (!r._ro) return;
-      ensure(r._ro, r);
+      let x = ensure(r._ro, r);
+      if (!x.territory && (r.Territory || r.territory)) x.territory = r.Territory || r.territory;
+      if (!x.area && (r['Sales Area'] || r.Salesarea || r.sales_area)) x.area = r['Sales Area'] || r.Salesarea || r.sales_area;
+      if (!x.vendor && (r['RA Vendor'] || r.RA_Vendor || r.vendor)) x.vendor = r['RA Vendor'] || r.RA_Vendor || r.vendor;
+      if (!x.state && (r.State || r.state)) x.state = r.State || r.state;
+      let cap = num(r['On-Boarded Tankage (KL)'] ?? r['On-boarded Tankage']) || 0;
+      let pName = key(r._product || r['Product Name'] || '');
+      if (pName.includes('EBMS')) x.ebmsCap = Math.max(x.ebmsCap, cap);
+      else if (pName.includes('HSD')) x.hsdCap = Math.max(x.hsdCap, cap);
+      if (!x.tanks.some(t => String(t._tank || t['Local tank id'] || '').replace(/\.0+$/, '') === String(r._tank || '').replace(/\.0+$/, ''))) {
+        x.tanks.push({
+          ROID: r._ro,
+          'Local tank id': r._tank,
+          _tank: r._tank,
+          Product_Name: r._product || r['Product Name'],
+          _product: r._product,
+          Status: 'ONLINE',
+          'On-Boarded Tankage (KL)': r['On-Boarded Tankage (KL)'],
+          Table_updated_at: r.Date || r.Time || 'Hourly stock'
+        });
+        x.online++;
+      }
     });
     return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  function fillFilters() {
-    const fields = [['territory', 'territory'], ['area', 'area'], ['vendor', 'vendor'], ['state', 'state']];
+  function fillTerritoryFilter() {
+    const el = $('territory');
+    if (!el) return;
+    const cur = window.MS ? MS.vals(el) : (el.value ? [el.value] : []);
+    let vals = [...new Set(allRO.map(r => r.territory).filter(Boolean))].sort();
+    if (window.GlobalScope) {
+      GlobalScope.registerTerritories(vals);
+      vals = [...new Set(vals.concat(GlobalScope.territories()))].sort();
+    }
+    let active = cur.length ? cur : (window.GlobalScope && GlobalScope.active() ? GlobalScope.get() : []);
+    active = active.filter(v => vals.includes(v));
+
+    el.innerHTML = '<option value="">All Territories</option>' + vals.map(v => `<option value="${esc(v)}"${active.includes(v) ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    if (window.MS) {
+      MS.set(el, active);
+    } else {
+      el.value = active[0] || '';
+    }
+  }
+
+  function updateDependentFilters() {
+    const terrEl = $('territory');
+    const pick = el => !el ? [] : (window.MS ? MS.vals(el) : (el.value ? [el.value] : []));
+    let territory = pick(terrEl);
+    if (!territory.length && window.GlobalScope && GlobalScope.active()) {
+      territory = GlobalScope.get();
+    }
+    const inSet = (arr, v) => !arr || !arr.length || arr.map(x => String(x).trim()).includes(String(v == null ? '' : v).trim());
+    
+    // Filter outlets belonging to the selected territory scope
+    const scopedROs = allRO.filter(r => (territory.length ? inSet(territory, r.territory) : (!window.GlobalScope || GlobalScope.match(r.territory))));
+
+    const fields = [['area', 'area'], ['vendor', 'vendor'], ['state', 'state']];
     fields.forEach(([id, k]) => {
       const el = $(id);
       if (!el) return;
-      const old = el.value;
-      const vals = [...new Set(allRO.map(r => r[k]).filter(Boolean))].sort();
-      const label = { territory: 'Territories', area: 'Sales Areas', vendor: 'RA Vendors', state: 'States' }[id] || (k.charAt(0).toUpperCase() + k.slice(1) + 's');
-      el.innerHTML = `<option value="">All ${label}</option>` + vals.map(v => `<option value="${esc(v)}"${v === old ? ' selected' : ''}>${esc(v)}</option>`).join('');
+      const curSelected = pick(el);
+      const available = [...new Set(scopedROs.map(r => r[k]).filter(Boolean))].sort();
+      const validSelected = curSelected.filter(v => available.includes(v));
+      const label = { area: 'Sales Areas', vendor: 'RA Vendors', state: 'States' }[id] || (k.charAt(0).toUpperCase() + k.slice(1) + 's');
+
+      el.innerHTML = `<option value="">All ${label}</option>` + available.map(v => `<option value="${esc(v)}"${validSelected.includes(v) ? ' selected' : ''}>${esc(v)}</option>`).join('');
+      
+      if (window.MS) {
+        MS.set(el, validSelected);
+      } else {
+        el.value = validSelected[0] || '';
+      }
     });
+  }
+
+  let kpiRows = [];   // outlets behind the KPI cards (current filter selection)
+
+  function updateKPIs(rows) {
+    const kpisEl = $('kpis');
+    if (!kpisEl) return;
+    kpiRows = rows;
+    let totalT = 0, on = 0, off = 0, latestCount = 0;
+    rows.forEach(r => {
+      totalT += r.tanks.length;
+      on += r.online;
+      off += r.offline;
+      latestCount += (r.latest ? r.latest.length : 0);
+    });
+    const onPct = totalT ? on / totalT * 100 : 0;
+    const offPct = totalT ? off / totalT * 100 : 0;
+    const isFiltered = rows.length !== allRO.length;
+
+    kpisEl.innerHTML = [
+      ['outlets', 'Retail Outlets', rows.length, isFiltered ? `${rows.length.toLocaleString()} in selection` : 'Unique RO IDs', 'navy', null],
+      ['tanks', 'Onboarded Tanks', totalT, isFiltered ? `${totalT.toLocaleString()} in selection` : 'Tank records', 'blue', null],
+      ['online', 'Online Tanks', on, totalT ? `${onPct.toFixed(1)}% online` : 'Status marked Online', 'green', onPct],
+      ['offline', 'Offline Tanks', off, totalT ? `${offPct.toFixed(1)}% offline` : 'Status marked Offline', 'red', null],
+      ['latest', 'Latest Stock Records', latestCount, isFiltered ? `${latestCount.toLocaleString()} in selection` : 'Product-level records', 'yellow', null]
+    ].map(([id, label, val, sub, tone, bar]) => `
+      <button type="button" class="kpi ts-tone-${tone} ts-kpi-btn" data-ts-kpi="${id}" aria-label="${label}: ${Number(val || 0).toLocaleString('en-IN')} — show list">
+        <div class="klabel">${label}<span class="ts-kpi-open" aria-hidden="true">View list ›</span></div>
+        <div class="value">${Number(val || 0).toLocaleString('en-IN')}</div>
+        ${sub ? `<div class="sub">${sub}</div>` : ''}
+        ${bar != null ? `<div class="ts-kbar"><span style="width:${Math.max(0, Math.min(100, bar)).toFixed(1)}%"></span></div>` : ''}
+      </button>
+    `).join('');
+    if (!kpisEl.dataset.tsKpiBound) {
+      kpisEl.dataset.tsKpiBound = '1';
+      kpisEl.addEventListener('click', e => {
+        const b = e.target.closest('[data-ts-kpi]');
+        if (b) openKpiList(b.dataset.tsKpi);
+      });
+    }
   }
 
   function renderDashboard() {
     allRO = groupByRO();
-    fillFilters();
-    let totalT = 0, on = 0, off = 0;
-    allRO.forEach(r => { totalT += r.tanks.length; on += r.online; off += r.offline; });
-    const kpisEl = $('kpis');
-    if (kpisEl) {
-      const onPct = totalT ? on / totalT * 100 : 0;
-      kpisEl.innerHTML = [
-        ['Retail Outlets', allRO.length, 'Unique RO IDs', 'navy', null],
-        ['Onboarded Tanks', totalT, 'Tank records', 'blue', null],
-        ['Online Tanks', on, totalT ? `${onPct.toFixed(1)}% online` : 'Status marked Online', 'green', onPct],
-        ['Offline Tanks', off, totalT ? `${(off / totalT * 100).toFixed(1)}% offline` : 'Status marked Offline', 'red', null],
-        ['Latest Stock Records', data.latest.length, 'Product-level records', 'yellow', null]
-      ].map(([label, val, sub, tone, bar]) => `
-        <div class="kpi ts-tone-${tone}">
-          <div class="klabel">${label}</div>
-          <div class="value">${Number(val || 0).toLocaleString('en-IN')}</div>
-          ${sub ? `<div class="sub">${sub}</div>` : ''}
-          ${bar != null ? `<div class="ts-kbar"><span style="width:${Math.max(0, Math.min(100, bar)).toFixed(1)}%"></span></div>` : ''}
-        </div>
-      `).join('');
-    }
+    fillTerritoryFilter();
+    updateDependentFilters();
     drawROTable();
   }
 
-  let currentViewMode = (typeof window !== 'undefined' && window.innerWidth <= 768) ? 'cards' : 'table';
-
-  function setViewMode(mode) {
-    currentViewMode = mode;
-    const tab = $('tab-tank-stock') || document.querySelector('.tank-stock-standalone') || document.body;
-    const cardsBtn = $('viewCardsBtn');
-    const tableBtn = $('viewTableBtn');
-    if (mode === 'cards') {
-      tab.classList.remove('mode-table');
-      tab.classList.add('mode-cards');
-      if (cardsBtn) cardsBtn.classList.add('active');
-      if (tableBtn) tableBtn.classList.remove('active');
-    } else {
-      tab.classList.remove('mode-cards');
-      tab.classList.add('mode-table');
-      if (tableBtn) tableBtn.classList.add('active');
-      if (cardsBtn) cardsBtn.classList.remove('active');
+  function isLowStockSite(r) {
+    if (!r) return false;
+    // 1. Check latest product records for explicit stock percentage or low ratio
+    if (r.latest && r.latest.length) {
+      for (let i = 0; i < r.latest.length; i++) {
+        let rec = r.latest[i];
+        let sPct = num(rec['Stock %'] ?? rec.Stock_Pct);
+        if (sPct != null) {
+          if (sPct <= 1.0 && sPct > 0) sPct *= 100;
+          if (sPct <= 10.0) return true;
+        }
+        let cap = num(rec['On-boarded Tankage'] ?? rec['On-Boarded Tankage (KL)']);
+        let stk = num(rec.Stock);
+        if (cap != null && stk != null && cap > 0 && (stk / cap * 100) <= 10.0) return true;
+      }
     }
+    // 2. Check total or individual product capacity vs stock
+    let totalCap = r.capacity || (r.ebmsCap + r.hsdCap);
+    if (totalCap > 0 && (r.total / totalCap * 100) <= 10.0) return true;
+    if (r.ebmsCap > 0 && (r.ebms / r.ebmsCap * 100) <= 10.0) return true;
+    if (r.hsdCap > 0 && (r.hsd / r.hsdCap * 100) <= 10.0) return true;
+
+    // 3. Check latest hourly dip readings if available
+    let roHours = data.hourly ? data.hourly.filter(h => h._ro === r.id) : [];
+    for (let i = 0; i < roHours.length; i++) {
+      let hr = roHours[i];
+      let hours = ['11 PM', '10 PM', '9 PM', '8 PM', '7 PM', '6 PM', '5 PM', '4 PM', '3 PM', '2 PM', '1 PM', '12 PM', '11 AM', '10 AM', '9 AM', '8 AM', '7 AM', '6 AM', '5 AM', '4 AM', '3 AM', '2 AM', '1 AM', '12 AM'];
+      for (let j = 0; j < hours.length; j++) {
+        let v = num(hr[hours[j] + ' %'] ?? hr[hours[j]]);
+        if (v != null) {
+          if (v <= 1.0 && v > 0) v *= 100;
+          if (v <= 10.0) return true;
+          break; // latest reported hour for this tank
+        }
+      }
+    }
+    return false;
+  }
+
+  let filterLowStockOnly = false;
+
+  function setLowStockFilter(onlyLow) {
+    filterLowStockOnly = !!onlyLow;
+    const allBtn = $('viewAllSitesBtn') || $('viewTableBtn');
+    const lowBtn = $('viewLowStockBtn') || $('viewCardsBtn');
+    if (allBtn) allBtn.classList.toggle('active', !filterLowStockOnly);
+    if (lowBtn) lowBtn.classList.toggle('active', filterLowStockOnly);
+    window._tsPage = 1;
+    drawROTable();
   }
 
   function drawROTable() {
     const searchEl = $('search'), terrEl = $('territory'), areaEl = $('area'), vendEl = $('vendor'), stateEl = $('state');
     if (!searchEl) return;
     const pick = el => !el ? [] : (window.MS ? MS.vals(el) : (el.value ? [el.value] : []));
-    const inSet = (arr, v) => !arr.length || arr.includes(String(v || ''));
+    const inSet = (arr, v) => !arr || !arr.length || arr.map(x => String(x).trim()).includes(String(v == null ? '' : v).trim());
     const q = key(searchEl.value), territory = pick(terrEl), area = pick(areaEl), vendor = pick(vendEl), state = pick(stateEl);
-    let rows = allRO.filter(r => (!q || r.id.includes(q) || key(r.name).includes(q)) && inSet(territory, r.territory) && inSet(area, r.area) && inSet(vendor, r.vendor) && inSet(state, r.state));
-    if ($('rowCount')) $('rowCount').textContent = `${rows.length.toLocaleString()} outlets`;
+    let rows = allRO.filter(r => (!q || r.id.includes(q) || key(r.name).includes(q)) && (territory.length ? inSet(territory, r.territory) : (!window.GlobalScope || GlobalScope.match(r.territory))) && inSet(area, r.area) && inSet(vendor, r.vendor) && inSet(state, r.state));
+    
+    // Filter to Low Stock (≤ 10%) sites if active
+    if (filterLowStockOnly) {
+      rows = rows.filter(isLowStockSite);
+    }
+
+    // Dynamically update KPIs matching current filter selection
+    updateKPIs(rows);
+
+    // Pagination to prevent mobile browser crash on thousands of outlets
+    const TS_PAGE_SIZE = 40;
+    let page = window._tsPage || 1;
+    const totalPages = Math.max(1, Math.ceil(rows.length / TS_PAGE_SIZE));
+    if (page > totalPages) page = 1;
+    window._tsPage = page;
+    const startIdx = (page - 1) * TS_PAGE_SIZE;
+    const pagedRows = rows.slice(startIdx, startIdx + TS_PAGE_SIZE);
+
+    const countLabel = filterLowStockOnly ? 'low stock outlets (≤ 10%)' : 'outlets';
+    if ($('rowCount')) $('rowCount').textContent = `${rows.length.toLocaleString()} ${countLabel} (Showing ${rows.length ? startIdx + 1 : 0}–${Math.min(startIdx + TS_PAGE_SIZE, rows.length)})`;
 
     const tbody = $('roTable');
     if (tbody) {
-      tbody.innerHTML = rows.map(r => {
+      tbody.innerHTML = pagedRows.map(r => {
         let st = r.offline === 0 && r.online > 0 ? 'ONLINE' : (r.online === 0 ? 'OFFLINE' : 'PARTIAL');
-        return `<tr onclick="openRO('${r.id}')"><td class="ts-id" title="${esc(r.id)}">${esc(r.id)}</td><td class="ro-name" title="${esc(r.name)}">${esc(r.name)}</td><td title="${esc(r.territory)} / ${esc(r.area)}">${esc(r.territory)} <span class="muted">/ ${esc(r.area)}</span></td><td title="${esc(r.vendor)}">${esc(r.vendor)}</td><td class="num product-ebms">${fmt(r.ebms, 2)}</td><td class="num product-hsd">${fmt(r.hsd, 2)}</td><td class="num"><b>${fmt(r.total, 2)}</b></td><td class="num"><span class="ts-tanks">${r.online}/${r.tanks.length}</span></td><td><span class="pill ${st === 'OFFLINE' ? 'off' : st === 'ONLINE' ? '' : 'partial'}">${st === 'ONLINE' ? 'Online' : st === 'OFFLINE' ? 'Offline' : 'Partial'}</span></td></tr>`;
-      }).join('') || '<tr><td colspan="9" class="empty">No matching retail outlets found.</td></tr>';
+        let isLow = isLowStockSite(r);
+        let lowBadge = isLow ? ` <span class="pill off" style="padding:1px 6px; font-size:10px; margin-left:4px; vertical-align:middle;" title="Stock is 10% or below">Low Stock</span>` : '';
+        return `<tr onclick="openRO('${r.id}')"><td class="ts-id" title="${esc(r.id)}">${esc(r.id)}</td><td class="ro-name" title="${esc(r.name)}">${esc(r.name)}${lowBadge}</td><td title="${esc(r.territory)} / ${esc(r.area)}">${esc(r.territory)} <span class="muted">/ ${esc(r.area)}</span></td><td title="${esc(r.vendor)}">${esc(r.vendor)}</td><td class="num product-ebms">${fmt(r.ebms, 2)}</td><td class="num product-hsd">${fmt(r.hsd, 2)}</td><td class="num"><b>${fmt(r.total, 2)}</b></td><td class="num"><span class="ts-tanks">${r.online}/${r.tanks.length}</span></td><td><span class="pill ${st === 'OFFLINE' ? 'off' : st === 'ONLINE' ? '' : 'partial'}">${st === 'ONLINE' ? 'Online' : st === 'OFFLINE' ? 'Offline' : 'Partial'}</span></td></tr>`;
+      }).join('') || `<tr><td colspan="9" class="empty">${filterLowStockOnly ? 'No outlets with stock ≤ 10% found in this selection.' : 'No matching retail outlets found.'}</td></tr>`;
     }
 
     const cardWrap = $('roCardsWrap');
     if (cardWrap) {
-      cardWrap.innerHTML = rows.map(r => {
+      cardWrap.innerHTML = pagedRows.map(r => {
         let st = r.offline === 0 && r.online > 0 ? 'ONLINE' : (r.online === 0 ? 'OFFLINE' : 'PARTIAL');
         return `
           <div class="ro-card" onclick="openRO('${r.id}')">
@@ -463,7 +620,41 @@
         `;
       }).join('') || '<div class="empty">No matching retail outlets found.</div>';
     }
+
+    // Responsive pagination bar
+    let paginEl = $('tsPaginationControls');
+    if (!paginEl && cardWrap && cardWrap.parentNode) {
+      paginEl = document.createElement('div');
+      paginEl.id = 'tsPaginationControls';
+      cardWrap.parentNode.appendChild(paginEl);
+    }
+    if (paginEl) {
+      if (totalPages <= 1) {
+        paginEl.style.display = 'none';
+        paginEl.innerHTML = '';
+      } else {
+        paginEl.style.display = 'flex';
+        paginEl.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:12px 16px; margin-top:14px; background:var(--card-bg, #fff); border-radius:12px; border:1px solid var(--border-color, #e2e8f0); flex-wrap:wrap; gap:10px; font-size:13px;';
+        paginEl.innerHTML = `
+          <span style="font-weight:600; color:var(--text-muted, #64748b);">
+            Page <b>${page}</b> of <b>${totalPages}</b> (${rows.length.toLocaleString()} outlets)
+          </span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-sm" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page > 1 ? 'pointer' : 'not-allowed'}; opacity:${page > 1 ? '1' : '0.4'};" onclick="window.tsNavPage(-1)">← Previous</button>
+            <button class="btn btn-sm" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page < totalPages ? 'pointer' : 'not-allowed'}; opacity:${page < totalPages ? '1' : '0.4'};" onclick="window.tsNavPage(1)">Next →</button>
+          </div>
+        `;
+      }
+    }
   }
+
+  window.tsNavPage = function(delta) {
+    const cur = window._tsPage || 1;
+    window._tsPage = Math.max(1, cur + delta);
+    drawROTable();
+    const panel = $('dashboardView');
+    if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   window.openRO = function(id) {
     selectedRO = id;
@@ -477,16 +668,23 @@
     let prods = ['EBMS', 'HSD'];
     if ($('productSummaries')) {
       $('productSummaries').innerHTML = prods.map(p => {
-        let recs = ro.latest.filter(r => key(r['Product Name']) === p),
-            capacity = recs.reduce((s, r) => s + (num(r['On-boarded Tankage']) || 0), 0),
+        let recs = ro.latest.filter(r => key(r['Product Name']).includes(p) || p.includes(key(r['Product Name']))),
+            capacity = recs.reduce((s, r) => s + (num(r['On-boarded Tankage'] ?? r['On-Boarded Tankage (KL)']) || 0), 0),
             stock = recs.reduce((s, r) => s + (num(r.Stock) || 0), 0),
-            onlineCap = recs.reduce((s, r) => s + (num(r['On-Line Tankage']) || 0), 0),
-            ullage = Math.max(0, capacity - stock),
+            onlineCap = recs.reduce((s, r) => s + (num(r['On-Line Tankage'] ?? r['Online Tankage']) || 0), 0);
+        if (!capacity && ro.tanks) {
+          let pTanks = ro.tanks.filter(t => {
+            let tp = key(t.Product_Name || t['Product Name'] || t._product || '');
+            return tp.includes(p) || p.includes(tp);
+          });
+          capacity = pTanks.reduce((s, t) => s + (num(t['On-Boarded Tankage (KL)'] ?? t['On-boarded Tankage']) || 0), 0);
+        }
+        let ullage = Math.max(0, capacity - stock),
             net = capacity ? stock / capacity * 100 : 0;
         return `<div class="summarybox"><h3>STOCK SUMMARY — <span class="product-${p.toLowerCase()}">${p}</span></h3><table><thead><tr><th>Product</th><th class="num">Capacity (KL)</th><th class="num">Stock (KL)</th><th class="num">Ullage (KL)</th><th class="num">Stock %</th><th class="num">Ullage %</th></tr></thead><tbody><tr><td class="product-${p.toLowerCase()}">${p}</td><td class="num">${fmt(capacity, 2)}</td><td class="num">${fmt(stock, 2)}</td><td class="num">${fmt(ullage, 2)}</td><td class="num">${capacity ? fmt(net, 1) + '%' : '—'}</td><td class="num">${capacity ? fmt(100 - net, 1) + '%' : '—'}</td></tr></tbody></table><div class="small" style="padding:0 14px 12px">On-line tankage: ${fmt(onlineCap, 2)} KL • ${recs.length} product record(s)</div></div>`;
       }).join('');
     }
-    let tanks = ro.tanks.slice().sort((a, b) => (num(a['Local tank id']) || 0) - (num(b['Local tank id']) || 0));
+    let tanks = ro.tanks.slice().sort((a, b) => (num(a['Local tank id'] || a._tank) || 0) - (num(b['Local tank id'] || b._tank) || 0));
     if ($('tankCards')) {
       $('tankCards').innerHTML = tanks.length ? tanks.map(t => tankCard(t, ro)).join('') : '<div class="empty">No onboarded tank records for this RO.</div>';
       document.querySelectorAll('#tab-tank-stock .tank[data-tank], .tank[data-tank]').forEach(el => el.addEventListener('click', () => showHourly(id, el.dataset.tank, el.dataset.product)));
@@ -494,24 +692,70 @@
   };
 
   function tankCard(t, ro) {
-    let id = key(t['Local tank id']), p = key(t.Product_Name), hr = data.hourly.find(h => h._ro === ro.id && h._tank === id && h._product === p);
+    let id = String(t._tank || t['Local tank id'] || t['Tank ID'] || '').trim().replace(/\.0+$/, '');
+    let p = key(t.Product_Name || t['Product Name'] || t._product || '');
+    let hr = data.hourly.find(h => h._ro === ro.id && String(h._tank || '').replace(/\.0+$/, '') === id && (h._product === p || (h._product && h._product.includes(p)) || (p && p.includes(h._product))))
+          || data.hourly.find(h => h._ro === ro.id && String(h._tank || '').replace(/\.0+$/, '') === id);
     let hours = ['12 AM', '1 AM', '2 AM', '3 AM', '4 AM', '5 AM', '6 AM', '7 AM', '8 AM', '9 AM', '10 AM', '11 AM', '12 PM', '1 PM', '2 PM', '3 PM', '4 PM', '5 PM', '6 PM', '7 PM', '8 PM', '9 PM', '10 PM', '11 PM'];
-    let vals = hr ? hours.map(h => num(hr[h + ' %'])) : [];
-    let valid = vals.filter(v => v != null), current = valid.length ? valid[valid.length - 1] : null, first = valid.length ? valid[0] : null, capacity = num(t['On-Boarded Tankage (KL)']) ?? (hr ? num(hr['On-Boarded Tankage (KL)']): null);
-    let status = key(t.Status), up = String(t['Uptime_tank(%)'] ?? '—');
-    let color = p === 'EBMS' ? '#22bd42' : p === 'HSD' ? '#079fe8' : '#f2d000';
-    return `<div class="tank" data-tank="${esc(id)}" data-product="${esc(p)}"><div class="tanktop"><div class="tanktitle">Tank ${esc(id)} <small>(${fmt(capacity, 2)} KL)</small></div><div>${status === 'ONLINE' ? '🔒' : '⚠️'} <span class="tankproduct product-${p.toLowerCase()}">${esc(p)}</span></div></div><div class="tankmeta"><span>◈ ${esc(up)} uptime</span><span class="tag">${esc(t['Morning_Status'] || '—')} / ${esc(t['Evening_Status'] || '—')}</span></div><div class="gauge" style="--pct:${Math.max(0, Math.min(100, current ?? 0))};--gauge:${color}"><span>${current == null ? '—' : fmt(current, 2) + '%'}</span></div><div class="tankstats"><div><div class="statlabel">First reported %</div><div class="statvalue">${first == null ? '—' : fmt(first, 2) + '%'}</div></div><div style="text-align:right"><div class="statlabel">Latest hourly %</div><div class="statvalue">${current == null ? '—' : fmt(current, 2) + '%'}</div></div><div><div class="statlabel">Onboarded tankage</div><div class="statvalue">${fmt(capacity, 2)} KL</div></div><div style="text-align:right"><div class="statlabel">Online hours</div><div class="statvalue">${fmt(num(t.Online_hours))} / 24</div></div></div><div class="tankbottom"><div><div class="statlabel">Table updated</div><div class="statvalue">${esc(t.Table_updated_at || '—')}</div></div><div style="text-align:right"><div class="statlabel">Status</div><span class="pill ${status === 'OFFLINE' ? 'off' : status === 'ONLINE' ? '' : 'partial'}">${esc(t.Status || 'Unknown')}</span></div></div></div>`;
+    let vals = hr ? hours.map(h => num(hr[h + ' %'] ?? hr[h])) : [];
+    let valid = vals.filter(v => v != null);
+    // Convert 0..1 decimal fraction to 0..100 percentage (e.g. 0.54 -> 54.0%)
+    if (valid.length > 0 && valid.every(v => v >= 0 && v <= 1.0)) {
+      vals = vals.map(v => v != null ? v * 100 : null);
+      valid = vals.filter(v => v != null);
+    }
+    let current = valid.length ? valid[valid.length - 1] : null,
+        first = valid.length ? valid[0] : null,
+        capacity = num(t['On-Boarded Tankage (KL)'] ?? t['On-boarded Tankage'] ?? t.Tankage) ?? (hr ? num(hr['On-Boarded Tankage (KL)'] ?? hr['On-boarded Tankage']) : null);
+    if (capacity == null && ro && ro.latest) {
+      let rec = ro.latest.find(r => key(r['Product Name']).includes(p) || (p && p.includes(key(r['Product Name']))));
+      if (rec) capacity = num(rec['On-boarded Tankage'] ?? rec['On-Boarded Tankage (KL)']);
+    }
+    let status = key(t.Status || 'ONLINE');
+    let upRaw = t['Uptime_tank(%)'] ?? t['Tank_online(%)'] ?? t['Uptime(%)'] ?? t.Uptime;
+    let up = '—';
+    if (typeof upRaw === 'number') {
+      up = (upRaw <= 1 ? (upRaw * 100).toFixed(1) : upRaw.toFixed(1)) + '%';
+    } else if (upRaw !== null && upRaw !== undefined && String(upRaw).trim() !== '') {
+      let upNum = num(upRaw);
+      if (upNum != null) {
+        up = (upNum <= 1 ? (upNum * 100).toFixed(1) : upNum.toFixed(1)) + '%';
+      } else {
+        up = String(upRaw).trim();
+        if (!up.endsWith('%') && Number.isFinite(Number(up))) up += '%';
+      }
+    }
+    let morning = t.Morning_Status || t['Morning Status'] || '—';
+    let evening = t.Evening_Status || t['Evening Status'] || '—';
+    let onlineHrs = t.Online_hours ?? t['Online hours'] ?? t['Online_Hours'];
+    let tableUpdated = t.Table_updated_at || t['Table updated at'] || t['Updated_at'] || '—';
+    let isEbms = p.includes('EBMS') || p.includes('MS');
+    let color = isEbms ? '#22bd42' : (p.includes('HSD') ? '#079fe8' : '#f59e0b');
+    let displayProduct = p || (hr ? key(hr._product || hr['Product Name']) : '') || 'FUEL';
+    let gaugePct = current != null ? Math.max(0, Math.min(100, current)) : 0;
+
+    return `<div class="tank" data-tank="${esc(id)}" data-product="${esc(displayProduct)}"><div class="tanktop"><div class="tanktitle">Tank ${esc(id)} <small>(${fmt(capacity, 2)} KL)</small></div><div>${status === 'ONLINE' ? '🔒' : '⚠️'} <span class="tankproduct product-${displayProduct.toLowerCase()}">${esc(displayProduct)}</span></div></div><div class="tankmeta"><span>◈ ${esc(up)} uptime</span><span class="tag">${esc(morning)} / ${esc(evening)}</span></div><div class="gauge" style="--pct:${gaugePct};--gauge:${color}"><span>${current == null ? '—' : fmt(current, 2) + '%'}</span></div><div class="tankstats"><div><div class="statlabel">First reported %</div><div class="statvalue">${first == null ? '—' : fmt(first, 2) + '%'}</div></div><div style="text-align:right"><div class="statlabel">Latest hourly %</div><div class="statvalue">${current == null ? '—' : fmt(current, 2) + '%'}</div></div><div><div class="statlabel">Onboarded tankage</div><div class="statvalue">${fmt(capacity, 2)} KL</div></div><div style="text-align:right"><div class="statlabel">Online hours</div><div class="statvalue">${onlineHrs != null ? fmt(num(onlineHrs)) : '—'} / 24</div></div></div><div class="tankbottom"><div><div class="statlabel">Table updated</div><div class="statvalue">${esc(tableUpdated)}</div></div><div style="text-align:right"><div class="statlabel">Status</div><span class="pill ${status === 'OFFLINE' ? 'off' : status === 'ONLINE' ? '' : 'partial'}">${esc(t.Status || 'Unknown')}</span></div></div></div>`;
   }
 
   function showHourly(roId, tankId, product) {
-    let row = data.hourly.find(h => h._ro === roId && h._tank === key(tankId) && h._product === key(product));
+    let tId = String(tankId).trim().replace(/\.0+$/, '');
+    let pKey = key(product);
+    let row = data.hourly.find(h => h._ro === roId && String(h._tank || '').replace(/\.0+$/, '') === tId && (h._product === pKey || (h._product && h._product.includes(pKey)) || (pKey && pKey.includes(h._product))))
+           || data.hourly.find(h => h._ro === roId && String(h._tank || '').replace(/\.0+$/, '') === tId);
     $('hourlyPanel')?.classList.remove('hidden');
-    if ($('hourlyTitle')) $('hourlyTitle').textContent = `HOURLY STOCK TREND — TANK ${tankId} (${product})`;
+    if ($('hourlyTitle')) $('hourlyTitle').textContent = `HOURLY STOCK TREND — TANK ${tId} (${product || 'ALL'})`;
     if ($('hourlySubtitle')) $('hourlySubtitle').textContent = 'Hourly stock percentage from Stock hourly.xlsx';
     let hours = ['12 AM', '1 AM', '2 AM', '3 AM', '4 AM', '5 AM', '6 AM', '7 AM', '8 AM', '9 AM', '10 AM', '11 AM', '12 PM', '1 PM', '2 PM', '3 PM', '4 PM', '5 PM', '6 PM', '7 PM', '8 PM', '9 PM', '10 PM', '11 PM'];
-    let vals = hours.map(h => row ? num(row[h + ' %']) : null), max = Math.max(100, ...vals.filter(v => v != null));
+    let vals = hours.map(h => row ? num(row[h + ' %'] ?? row[h]) : null);
+    let valid = vals.filter(v => v != null);
+    if (valid.length > 0 && valid.every(v => v >= 0 && v <= 1.0)) {
+      vals = vals.map(v => v != null ? v * 100 : null);
+    }
+    let max = Math.max(100, ...vals.filter(v => v != null));
     if ($('hourlyChart')) {
-      $('hourlyChart').innerHTML = vals.map((v, i) => `<div class="barwrap" title="${hours[i]}: ${v == null ? 'No data' : fmt(v, 2) + '%'}"><small>${v == null ? '' : fmt(v, 0)}</small><div class="bar" style="height:${v == null ? 0 : Math.max(2, v / max * 145)}px;background:${key(product) === 'EBMS' ? '#22bd42' : '#079fe8'}"></div><label>${hours[i].replace(' ', '')}</label></div>`).join('');
+      let isEbms = pKey.includes('EBMS') || pKey.includes('MS');
+      let barBg = isEbms ? '#22bd42' : '#079fe8';
+      $('hourlyChart').innerHTML = vals.map((v, i) => `<div class="barwrap" title="${hours[i]}: ${v == null ? 'No data' : fmt(v, 2) + '%'}"><small>${v == null ? '' : fmt(v, 0)}</small><div class="bar" style="height:${v == null ? 0 : Math.max(2, v / max * 145)}px;background:${barBg}"></div><label>${hours[i].replace(' ', '')}</label></div>`).join('');
     }
     $('hourlyPanel')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -586,6 +830,12 @@
     const chooseFolderNow = $('chooseFolderNow');
     const copyGdrivePathBtn = $('copyGdrivePathBtn');
 
+    const syncBtn = $('tsSyncBtn');
+    const sheetChip = $('tsSheetChip');
+    if (syncBtn) syncBtn.onclick = () => syncFromSheet(false);
+    if (sheetChip) sheetChip.onclick = () => syncFromSheet(false);
+    if (window.__sheetSync && window.__sheetSync.at) markSynced(window.__sheetSync.at, window.__sheetSync.tankFound);
+
     if (folderBtn) {
       folderBtn.onclick = async () => {
         // If we have a stored handle that just needs permission granted:
@@ -642,36 +892,436 @@
       };
     }
 
-    const viewCardsBtn = $('viewCardsBtn');
-    const viewTableBtn = $('viewTableBtn');
-    if (viewCardsBtn) viewCardsBtn.onclick = () => {
-      sessionStorage.setItem('bpcl_tank_view_manual', '1');
-      setViewMode('cards');
-    };
-    if (viewTableBtn) viewTableBtn.onclick = () => {
-      sessionStorage.setItem('bpcl_tank_view_manual', '1');
-      setViewMode('table');
-    };
-    setViewMode((typeof window !== 'undefined' && window.innerWidth <= 768) ? 'cards' : 'table');
+    const allBtn = $('viewAllSitesBtn') || $('viewTableBtn');
+    const lowBtn = $('viewLowStockBtn') || $('viewCardsBtn');
+    if (allBtn) {
+      allBtn.onclick = () => setLowStockFilter(false);
+    }
+    if (lowBtn) {
+      lowBtn.onclick = () => setLowStockFilter(true);
+    }
 
-    ['search', 'territory', 'area', 'vendor', 'state'].forEach(id => {
+    const terrEl = $('territory');
+    if (terrEl) {
+      terrEl.addEventListener('change', () => {
+        window._tsPage = 1;
+        updateDependentFilters();
+        drawROTable();
+      });
+    }
+
+    ['search', 'area', 'vendor', 'state'].forEach(id => {
       const el = $(id);
-      if (el) el.addEventListener(id === 'search' ? 'input' : 'change', drawROTable);
+      if (el) el.addEventListener(id === 'search' ? 'input' : 'change', () => {
+        window._tsPage = 1;
+        drawROTable();
+      });
     });
 
-    // Check auto connection to Google Drive
-    autoConnectGoogleDrive().then(connected => {
-      if (!connected) {
-        tryPreloadLocalFiles();
-      }
-    });
+    // Data source: the Google Sheet workbook (shared sync in the main app).
+    if (typeof window.syncGoogleSheet !== 'function') {
+      // Standalone page: sync now, then re-check every few minutes (unchanged sheet = no work)
+      syncFromSheet(true);
+      const mins = Math.max(2, parseInt(localStorage.getItem('bpcl_sheet_autosync_min') || '5', 10) || 5);
+      setInterval(() => { if (document.visibilityState === 'visible') syncFromSheet(true); }, mins * 60000);
+    }
   }
+
+  /* ---------- Google Sheet feed (same workbook as the uptime data) ---------- */
+  function setChip(state, text) {
+    const chip = $('tsSheetChip');
+    if (!chip) return;
+    chip.className = 'btn ts-drive' + (state === 'ok' ? ' is-connected' : '');
+    chip.innerHTML = `<span class="ts-dot ${state === 'ok' ? 'on' : state === 'warn' ? 'warn' : ''}"></span><span>${text}</span>`;
+  }
+
+  function ingestSheets(t) {
+    const found = !!(t && (t.latest || t.hourly || t.onboarded));
+    if (!found) {
+      if ($('dataStatus') && !data.latest.length) {
+        $('dataStatus').innerHTML = '<span class="ts-dot warn"></span> No tank sheets in the Google workbook yet — add sheets named <b>Last updated stock</b>, <b>Stock hourly</b> and <b>Onboarded tanks</b>.';
+      }
+      if (!data.latest.length) tryPreloadLocalFiles();
+      return;
+    }
+    if (t.latest) data.latest = t.latest;
+    if (t.hourly) data.hourly = t.hourly;
+    if (t.onboarded) data.onboarded = t.onboarded;
+    source = 'sheet';
+    allRO = groupByRO();
+    notifyDashboard();
+    // Heavy redraw only when the page is on screen; otherwise when it is opened
+    if (isVisible()) renderDashboard(); else renderPending = true;
+    if ($('dataStatus')) $('dataStatus').innerHTML = statusLine('Google Sheet');
+    if ($('updatedAt')) $('updatedAt').textContent = 'Stock refreshed at ' + new Date().toLocaleTimeString();
+  }
+
+  function markSynced(at, found) {
+    lastSyncAt = at || Date.now();
+    if (found === false) setChip('warn', 'Google Sheet · no tank sheets');
+    else setChip('ok', `Google Sheet · synced ${hhmm(lastSyncAt)}`);
+  }
+  let lookupTimer = null;
+  function refreshLookup() {
+    if (!data.latest.length && !data.onboarded.length) return;
+    clearTimeout(lookupTimer);
+    lookupTimer = setTimeout(() => {
+      allRO = groupByRO();
+      if (isVisible()) renderDashboard(); else renderPending = true;
+      notifyDashboard();
+    }, 50);
+  }
+  function markLoading() {
+    setChip('', 'Google Sheet · loading tank sheets…');
+    if ($('dataStatus') && !data.latest.length) $('dataStatus').innerHTML = '<span class="ts-dot"></span> Reading tank sheets from the Google workbook…';
+  }
+  function markSyncError(msg) {
+    setChip('warn', 'Google Sheet · sync failed');
+    if ($('dataStatus') && !data.latest.length) $('dataStatus').innerHTML = '<span class="ts-dot warn"></span> ' + esc(msg || 'Could not read the Google Sheet');
+  }
+
+  async function syncFromSheet(silent) {
+    // Inside the main app: the shared sync refreshes uptime + tank together
+    if (typeof window.syncGoogleSheet === 'function') {
+      try { await window.syncGoogleSheet(!!silent); }
+      catch (e) { markSyncError(e.message); }
+      return;
+    }
+    // Standalone page: read the same workbook directly
+    try {
+      setChip('', 'Google Sheet · syncing…');
+      const url = (window.resolveSheetExportUrl && window.resolveSheetExportUrl()) || standaloneSheetUrl();
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) throw new Error('Google Sheet could not be read (' + resp.status + ')');
+      const buf = await resp.arrayBuffer();
+      const fp = window.WorkbookReader.fingerprint(buf);
+      if (fp !== standaloneFp || !data.latest.length) {
+        const book = await window.WorkbookReader.read(buf);
+        ingestSheets({ latest: book.byKind('tank_latest'), hourly: book.byKind('tank_hourly'), onboarded: book.byKind('tank_onboarded') });
+        standaloneFp = fp;
+        markSynced(Date.now(), !!(book.byKind('tank_latest') || book.byKind('tank_hourly')));
+      } else markSynced(Date.now(), true);
+      if (!silent && window.showToast) window.showToast('Tank stock synced from Google Sheet', 'success');
+    } catch (e) {
+      markSyncError(e.message);
+      if (!data.latest.length) tryPreloadLocalFiles();
+    }
+  }
+  let standaloneFp = null;
+  function standaloneSheetUrl() {
+    let u = (localStorage.getItem('bpcl_google_sheet_url') || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS3EE_SNele4ucfWLc38wDtMaSB18jj2OgCw-Ze8D76Xt5657yylbThfpJ3GF9_9-I6bCcudKh4z42o/pub?output=xlsx').trim();
+    if (u.includes('pub?output=csv')) u = u.replace('pub?output=csv', 'pub?output=xlsx');
+    else if (u.includes('/edit')) u = u.replace(/\/edit.*$/, '/export?format=xlsx');
+    return u;
+  }
+
+  function onScopeChange() {
+    const terrEl = $('territory');
+    if (terrEl && window.GlobalScope) {
+      const gVals = GlobalScope.get();
+      if (window.MS) MS.set(terrEl, gVals);
+      else terrEl.value = gVals[0] || '';
+    }
+    window._tsPage = 1;
+    updateDependentFilters();
+    drawROTable();
+  }
+
+  // ---------------------------------------------------------------------------
+  // KPI card → popup list of the records behind the number, with download
+  // ---------------------------------------------------------------------------
+  const roStatus = r => r.offline === 0 && r.online > 0 ? 'Online' : (r.online === 0 ? 'Offline' : 'Partial');
+  const tankId = t => String(t._tank ?? t['Local tank id'] ?? t['Tank ID'] ?? '').trim().replace(/\.0+$/, '');
+  const tankProd = t => key(t.Product_Name || t['Product Name'] || t._product || '') || '—';
+  const tankCap = t => num(t['On-Boarded Tankage (KL)'] ?? t['On-boarded Tankage'] ?? t.Tankage);
+  const tankSt = t => { const k = key(t.Status); return k === 'ONLINE' ? 'Online' : k === 'OFFLINE' ? 'Offline' : (t.Status ? String(t.Status) : '—'); };
+  const recTime = rec => {
+    const k = Object.keys(rec).find(c => /(last\s*updated|updated\s*(at|on|time)|date\s*time|timestamp|reading\s*time|^date$|^time$)/i.test(c));
+    return k ? rec[k] : '';
+  };
+
+  function kpiDataset(id) {
+    const rows = kpiRows || [];
+    const roCols = ['RO ID', 'Retail Outlet', 'Territory', 'Sales Area', 'RA Vendor'];
+    const ro = r => [r.id, r.name, r.territory, r.area, r.vendor];
+    if (id === 'outlets') {
+      return {
+        title: 'Retail Outlets', tone: 'navy',
+        cols: roCols.concat(['EBMS Stock (KL)', 'HSD Stock (KL)', 'Total Stock (KL)', 'Tanks Online', 'Tanks', 'Status']),
+        num: [5, 6, 7, 8, 9],
+        rows: rows.map(r => ro(r).concat([r.ebms, r.hsd, r.total, r.online, r.tanks.length, roStatus(r)]))
+      };
+    }
+    if (id === 'tanks' || id === 'online' || id === 'offline') {
+      const want = id === 'online' ? 'Online' : id === 'offline' ? 'Offline' : null;
+      const out = [];
+      rows.forEach(r => r.tanks.forEach(t => {
+        const st = tankSt(t);
+        if (want && st !== want) return;
+        out.push(ro(r).concat([tankId(t) || '—', tankProd(t), tankCap(t), st]));
+      }));
+      out.sort((a, b) => String(a[3]).localeCompare(String(b[3])) || (parseInt(a[0], 10) - parseInt(b[0], 10)) || (num(a[5]) || 0) - (num(b[5]) || 0));
+      return {
+        title: id === 'online' ? 'Online Tanks' : id === 'offline' ? 'Offline Tanks' : 'Onboarded Tanks',
+        tone: id === 'online' ? 'green' : id === 'offline' ? 'red' : 'blue',
+        cols: roCols.concat(['Tank ID', 'Product', 'Tankage (KL)', 'Status']),
+        num: [7], rows: out
+      };
+    }
+    // latest stock records (product level)
+    const out = [];
+    let hasTime = false;
+    rows.forEach(r => (r.latest || []).forEach(rec => {
+      const stock = num(rec.Stock), cap = num(rec['On-boarded Tankage'] ?? rec['On-Boarded Tankage'] ?? rec['On-Boarded Tankage (KL)']);
+      const t = recTime(rec); if (t) hasTime = true;
+      out.push(ro(r).concat([key(rec['Product Name'] || rec._product || '') || '—', stock, cap, (stock != null && cap) ? +(stock / cap * 100).toFixed(1) : null, t]));
+    }));
+    out.sort((a, b) => (a[8] ?? 999) - (b[8] ?? 999));   // lowest stock % first
+    const cols = roCols.concat(['Product', 'Stock (KL)', 'Tankage (KL)', 'Stock %']);
+    return {
+      title: 'Latest Stock Records', tone: 'yellow',
+      cols: hasTime ? cols.concat(['Last Updated']) : cols,
+      num: [6, 7, 8], pctCol: 8,
+      rows: hasTime ? out : out.map(x => x.slice(0, 9))
+    };
+  }
+
+  let kpiPop = null, kpiCur = null;
+
+  function ensureKpiPop() {
+    if (kpiPop) return kpiPop;
+    kpiPop = document.createElement('div');
+    kpiPop.className = 'ts-kpop-back';
+    kpiPop.hidden = true;
+    kpiPop.innerHTML = `
+      <div class="ts-kpop" role="dialog" aria-modal="true" aria-labelledby="ts-kpop-title">
+        <div class="ts-kpop-head">
+          <div><h3 id="ts-kpop-title"></h3><div class="ts-kpop-sub" id="ts-kpop-sub"></div></div>
+          <button type="button" class="ts-kpop-x" aria-label="Close">✕</button>
+        </div>
+        <div class="ts-kpop-tools">
+          <label class="ts-kpop-search"><span class="sr-only">Search this list</span>
+            <input type="search" id="ts-kpop-q" placeholder="Search RO ID, outlet, sales area, product…" autocomplete="off">
+          </label>
+          <div class="ts-kpop-dl">
+            <button type="button" class="ts-kpop-btn" data-dl="xlsx">Download Excel</button>
+            <button type="button" class="ts-kpop-btn ts-kpop-btn2" data-dl="csv">CSV</button>
+          </div>
+        </div>
+        <div class="ts-kpop-table"><table><thead></thead><tbody></tbody></table></div>
+        <div class="ts-kpop-foot" id="ts-kpop-foot"></div>
+      </div>`;
+    document.body.appendChild(kpiPop);
+    const close = () => { kpiPop.hidden = true; document.body.classList.remove('ts-kpop-open'); if (kpiPop._from) kpiPop._from.focus(); };
+    kpiPop.addEventListener('click', e => {
+      if (e.target === kpiPop || e.target.closest('.ts-kpop-x')) close();
+      const d = e.target.closest('[data-dl]');
+      if (d) downloadKpi(d.dataset.dl);
+      const tr = e.target.closest('tr[data-ro]');
+      if (tr) { close(); window.openRO && window.openRO(tr.dataset.ro); }
+    });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !kpiPop.hidden) close(); });
+    kpiPop.querySelector('#ts-kpop-q').addEventListener('input', () => drawKpiRows());
+    return kpiPop;
+  }
+
+  function filteredKpiRows() {
+    const q = key(kpiPop.querySelector('#ts-kpop-q').value || '');
+    if (!q) return kpiCur.rows;
+    return kpiCur.rows.filter(r => r.some(v => key(v == null ? '' : v).includes(q)));
+  }
+
+  function cellHtml(v, i) {
+    const d = kpiCur;
+    if (d.num.includes(i)) {
+      if (v == null || v === '') return '<td class="num">—</td>';
+      const n = Number(v);
+      const txt = i === d.pctCol ? fmt(n, 1) + '%' : (/\(KL\)/.test(d.cols[i]) ? fmt(n, 2) : fmt(n));
+      const low = i === d.pctCol && n <= 10 ? ' ts-kpop-low' : '';
+      return `<td class="num${low}">${txt}</td>`;
+    }
+    const s = String(v ?? '');
+    if (/^(Online|Offline|Partial)$/.test(s)) return `<td><span class="pill ${s === 'Offline' ? 'off' : s === 'Partial' ? 'partial' : ''}">${s}</span></td>`;
+    return `<td title="${esc(s)}">${esc(s) || '—'}</td>`;
+  }
+
+  function drawKpiRows() {
+    const list = filteredKpiRows();
+    const MAX = 1500;
+    kpiPop.querySelector('tbody').innerHTML = list.length
+      ? list.slice(0, MAX).map(r => `<tr data-ro="${esc(r[0])}" title="Open ${esc(r[1])}">${r.map(cellHtml).join('')}</tr>`).join('')
+      : `<tr><td colspan="${kpiCur.cols.length}" class="ts-kpop-none">No matching records</td></tr>`;
+    kpiPop.querySelector('#ts-kpop-foot').textContent =
+      `${list.length.toLocaleString('en-IN')} of ${kpiCur.rows.length.toLocaleString('en-IN')} records` +
+      (list.length > MAX ? ` · showing first ${MAX.toLocaleString('en-IN')} — download for the full list` : '') +
+      ' · click a row to open the outlet';
+  }
+
+  function openKpiList(id) {
+    ensureKpiPop();
+    kpiCur = kpiDataset(id);
+    kpiCur.id = id;
+    kpiPop._from = document.activeElement;
+    const pop = kpiPop.querySelector('.ts-kpop');
+    pop.className = 'ts-kpop ts-kpop-' + kpiCur.tone;
+    kpiPop.querySelector('#ts-kpop-title').textContent = `${kpiCur.title} — ${kpiCur.rows.length.toLocaleString('en-IN')}`;
+    const terr = window.GlobalScope && GlobalScope.active() ? GlobalScope.get().join(', ') : 'All territories';
+    kpiPop.querySelector('#ts-kpop-sub').textContent = `${terr} · current filters applied`;
+    kpiPop.querySelector('thead').innerHTML = '<tr>' + kpiCur.cols.map((c, i) => `<th class="${kpiCur.num.includes(i) ? 'num' : ''}">${esc(c)}</th>`).join('') + '</tr>';
+    kpiPop.querySelector('#ts-kpop-q').value = '';
+    drawKpiRows();
+    kpiPop.hidden = false;
+    document.body.classList.add('ts-kpop-open');
+    setTimeout(() => kpiPop.querySelector('.ts-kpop-x').focus(), 30);
+  }
+
+  function downloadKpi(kind) {
+    if (!kpiCur) return;
+    const list = filteredKpiRows();
+    if (!list.length) { window.showToast && showToast('Nothing to download', 'error'); return; }
+    const stamp = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const base = `Tank_Stock_${kpiCur.title.replace(/\s+/g, '_')}_${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}_${pad(stamp.getHours())}${pad(stamp.getMinutes())}`;
+    const aoa = [kpiCur.cols].concat(list.map(r => r.map(v => v == null ? '' : v)));
+    if (kind === 'xlsx' && window.XLSX) {
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = kpiCur.cols.map((c, i) => ({ wch: Math.min(40, Math.max(c.length + 2, ...list.slice(0, 200).map(r => String(r[i] ?? '').length + 1))) }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, kpiCur.title.slice(0, 31));
+      XLSX.writeFile(wb, base + '.xlsx');
+    } else {
+      const csv = aoa.map(r => r.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n');
+      const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = base + '.csv'; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+  }
+  window.openTankKpiList = openKpiList;
+
+  // ---------------------------------------------------------------------------
+  // Export the Retail Outlet Stock Summary table (all filtered rows, every page)
+  // ---------------------------------------------------------------------------
+  function exportStockTable(kind) {
+    const rows = kpiRows || [];
+    if (!rows.length) { window.showToast && showToast('No outlets to export', 'error'); return; }
+    const cols = ['RO ID', 'Retail Outlet', 'Territory', 'Sales Area', 'RA Vendor', 'State',
+      'EBMS Stock (KL)', 'EBMS Tankage (KL)', 'HSD Stock (KL)', 'HSD Tankage (KL)', 'Total Stock (KL)', 'Total Tankage (KL)', 'Stock %',
+      'Tanks Online', 'Tanks', 'Status', 'Low Stock (≤10%)'];
+    const r2 = v => v == null || !isFinite(v) ? '' : Math.round(v * 100) / 100;
+    // product tankage straight from the records (latest stock rows, else onboarded tanks)
+    const prodCap = (r, p) => {
+      const match = x => { const k = key(x || ''); return p === 'EBMS' ? k.includes('EBMS') : k === 'HSD' || k.includes('HSD'); };
+      const fromLatest = (r.latest || []).filter(x => match(x['Product Name'] || x._product))
+        .reduce((s2, x) => s2 + (num(x['On-boarded Tankage'] ?? x['On-Boarded Tankage'] ?? x['On-Boarded Tankage (KL)']) || 0), 0);
+      if (fromLatest) return fromLatest;
+      return (r.tanks || []).filter(t => match(t.Product_Name || t['Product Name'] || t._product))
+        .reduce((s2, t) => s2 + (tankCap(t) || 0), 0);
+    };
+    const aoa = [cols].concat(rows.map(r => [
+      r.id, r.name, r.territory, r.area, r.vendor, r.state,
+      r2(r.ebms), r2(prodCap(r, 'EBMS')), r2(r.hsd), r2(prodCap(r, 'HSD')), r2(r.total), r2(r.capacity),
+      r.capacity ? Math.round(r.total / r.capacity * 1000) / 10 : '',
+      r.online, r.tanks.length, roStatus(r), isLowStockSite(r) ? 'Yes' : 'No'
+    ]));
+    const d = new Date(), pad = n => String(n).padStart(2, '0');
+    const scope = filterLowStockOnly ? 'Low_Stock' : 'All_Outlets';
+    const base = `RO_Stock_Summary_${scope}_${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+    if (kind === 'xlsx' && window.XLSX) {
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = cols.map((c, i) => ({ wch: Math.min(42, Math.max(c.length + 2, ...aoa.slice(1, 300).map(r => String(r[i] ?? '').length + 1))) }));
+      ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: aoa.length - 1, c: cols.length - 1 } }) };
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'RO Stock Summary');
+      XLSX.writeFile(wb, base + '.xlsx');
+    } else {
+      const csv = aoa.map(r => r.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\r\n');
+      const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = base + '.csv'; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+    window.showToast && showToast(`Exported ${rows.length.toLocaleString('en-IN')} outlets`, 'success');
+  }
+
+  function bindStockExport() {
+    const btn = $('tsExportBtn'), menu = $('tsExportMenu');
+    if (!btn || !menu || btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    const close = () => { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const open = menu.hidden;
+      menu.hidden = !open; btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) menu.querySelector('button').focus();
+    });
+    menu.addEventListener('click', e => {
+      const b = e.target.closest('[data-ts-export]');
+      if (!b) return;
+      close(); exportStockTable(b.dataset.tsExport);
+    });
+    document.addEventListener('click', e => { if (!menu.hidden && !e.target.closest('.ts-export')) close(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !menu.hidden) { close(); btn.focus(); } });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindStockExport); else bindStockExport();
+  window.exportTankStockTable = exportStockTable;
+
+  /**
+   * Lowest-stock outlets for the Dashboard chart.
+   * Each outlet is ranked by its weakest product (stock ÷ on-boarded tankage
+   * from the "Last updated stock" sheet), so an outlet with HSD nearly dry is
+   * flagged even if its petrol tanks are full. Follows the global Territory filter.
+   */
+  function lowStockSites(n) {
+    if (!data.latest.length) return { ready: false, rows: [] };
+    if (!allRO.length) allRO = groupByRO();
+    const out = [];
+    allRO.forEach(r => {
+      if (window.GlobalScope && !GlobalScope.match(r.territory)) return;
+      const prod = {};
+      (r.latest || []).forEach(rec => {
+        const p = key(rec['Product Name'] || rec._product || '') || 'PRODUCT';
+        const stock = num(rec.Stock);
+        const cap = num(rec['On-boarded Tankage'] ?? rec['On-Boarded Tankage'] ?? rec['On-Boarded Tankage (KL)']);
+        if (stock == null || !cap) return;
+        prod[p] = prod[p] || { stock: 0, cap: 0 };
+        prod[p].stock += stock; prod[p].cap += cap;
+      });
+      let worst = null;
+      Object.keys(prod).forEach(p => {
+        const pct = Math.max(0, prod[p].stock / prod[p].cap * 100);
+        if (!worst || pct < worst.pct) worst = { product: p, pct, stock: prod[p].stock, cap: prod[p].cap };
+      });
+      if (worst) out.push({ id: r.id, name: r.name, area: r.area, territory: r.territory, product: worst.product, pct: worst.pct, stock: worst.stock, cap: worst.cap });
+    });
+    out.sort((a, b) => a.pct - b.pct || a.stock - b.stock);
+    return { ready: true, rows: out.slice(0, n || 10), total: out.length };
+  }
+
+  // Dashboard "low stock" chart follows the tank data
+  function notifyDashboard() { if (typeof window.renderLowStockChart === 'function') setTimeout(window.renderLowStockChart, 0); }
+
+  window.TankStock = { ingestSheets, markSynced, markLoading, markSyncError, syncFromSheet, refreshLookup, onScopeChange, lowStockSites };
 
   window.initTankStockDashboard = function() {
     // Events and Drive auto-connect run once; re-opening the menu only refreshes the view
     if (!tankInitDone) { initEvents(); return; }
-    if (!sessionStorage.getItem('bpcl_tank_view_manual')) setViewMode(window.innerWidth <= 768 ? 'cards' : 'table');
-    if (allRO && allRO.length) drawROTable();
+    if (renderPending) { renderPending = false; renderDashboard(); }
+    else if (allRO && allRO.length) {
+      const terrEl = $('territory');
+      if (terrEl && window.GlobalScope) {
+        const gVals = GlobalScope.get();
+        const curVals = window.MS ? MS.vals(terrEl) : (terrEl.value ? [terrEl.value] : []);
+        const same = gVals.length === curVals.length && gVals.every(x => curVals.includes(x));
+        if (!same) {
+          if (window.MS) MS.set(terrEl, gVals);
+          else terrEl.value = gVals[0] || '';
+          updateDependentFilters();
+        }
+      }
+      drawROTable();
+    }
+    if (!data.latest.length && window.__sheetSync && !window.__sheetSync.busy && !window.__sheetSync.at) syncFromSheet(true);
   };
 
   if (document.readyState === 'loading') {

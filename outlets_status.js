@@ -10,7 +10,7 @@
  */
 
 (function() {
-  let outletsStatusSortField = 'roid';
+  let outletsStatusSortField = 'sales_area'; // default: by sales area, then RO code
   let outletsStatusSortAsc = true;
   let outletsStatusFilteredList = [];
   const debounceTimers = {};
@@ -246,6 +246,8 @@
 
     // Sorting
     filtered.sort((a, b) => {
+      const byArea = window.compareBySalesArea ? window.compareBySalesArea(a, b) : 0;
+      if (outletsStatusSortField === 'sales_area') return outletsStatusSortAsc ? byArea : -byArea;
       let valA, valB;
       if (outletsStatusSortField === 'responsibility' || outletsStatusSortField === 'date' || outletsStatusSortField === 'target_date') {
         const storedA = getStoredOutletData(a.roid);
@@ -265,11 +267,20 @@
 
       if (valA < valB) return outletsStatusSortAsc ? -1 : 1;
       if (valA > valB) return outletsStatusSortAsc ? 1 : -1;
-      return 0;
+      return byArea;
     });
 
     outletsStatusFilteredList = filtered;
     window.outletsStatusFilteredList = filtered;
+
+    // Pagination to prevent mobile browser crash on thousands of outlets
+    const OS_PAGE_SIZE = 40;
+    let page = window._osPage || 1;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / OS_PAGE_SIZE));
+    if (page > totalPages) page = 1;
+    window._osPage = page;
+    const startIdx = (page - 1) * OS_PAGE_SIZE;
+    const pagedOutlets = filtered.slice(startIdx, startIdx + OS_PAGE_SIZE);
 
     // Update count badge
     const countBadge = document.getElementById('outlets-status-count-badge');
@@ -281,12 +292,14 @@
 
     if (filtered.length === 0) {
       tbody.innerHTML = `<tr><td colspan="13" style="text-align: center; padding: 2.5rem; color: var(--text-muted); font-weight: 600;">No partial or offline 2-slot outlets matching the selected criteria.</td></tr>`;
+      const pEl = document.getElementById('outlets-status-pagination');
+      if (pEl) pEl.style.display = 'none';
       return;
     }
 
     const fragment = document.createDocumentFragment();
 
-    filtered.forEach(ro => {
+    pagedOutlets.forEach(ro => {
       const tr = document.createElement('tr');
       const nlStatus = get2SlotStatus(ro);
       const stored = getStoredOutletData(ro.roid);
@@ -415,7 +428,42 @@
     });
 
     tbody.appendChild(fragment);
+
+    // Responsive pagination bar
+    let paginEl = document.getElementById('outlets-status-pagination');
+    const tableContainer = document.querySelector('#tab-outlets-status .table-responsive-container');
+    if (!paginEl && tableContainer && tableContainer.parentNode) {
+      paginEl = document.createElement('div');
+      paginEl.id = 'outlets-status-pagination';
+      tableContainer.parentNode.appendChild(paginEl);
+    }
+    if (paginEl) {
+      if (totalPages <= 1) {
+        paginEl.style.display = 'none';
+        paginEl.innerHTML = '';
+      } else {
+        paginEl.style.display = 'flex';
+        paginEl.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:12px 18px; margin:10px 1.75rem 1rem; background:var(--card-bg, #fff); border-radius:10px; border:1px solid var(--border-color, #e2e8f0); flex-wrap:wrap; gap:10px; font-size:13px;';
+        paginEl.innerHTML = `
+          <span style="font-weight:600; color:var(--text-muted, #64748b);">
+            Showing ${startIdx + 1}–${Math.min(startIdx + OS_PAGE_SIZE, filtered.length)} of <b>${filtered.length.toLocaleString()}</b> outlets (Page <b>${page}</b> of <b>${totalPages}</b>)
+          </span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page > 1 ? 'pointer' : 'not-allowed'}; opacity:${page > 1 ? '1' : '0.4'};" onclick="window.osNavPage(-1)">← Previous</button>
+            <button class="btn-secondary" type="button" style="padding:6px 14px; font-weight:700; border-radius:8px; cursor:${page < totalPages ? 'pointer' : 'not-allowed'}; opacity:${page < totalPages ? '1' : '0.4'};" onclick="window.osNavPage(1)">Next →</button>
+          </div>
+        `;
+      }
+    }
   }
+
+  window.osNavPage = function(delta) {
+    const cur = window._osPage || 1;
+    window._osPage = Math.max(1, cur + delta);
+    renderOutletsStatusTable();
+    const target = document.getElementById('tab-outlets-status');
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   function exportOutletsStatusCSV() {
     const list = outletsStatusFilteredList;

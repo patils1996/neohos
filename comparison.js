@@ -103,6 +103,8 @@
   function normaliseRow(ro) {
     const cc = cleanId(ro.roid || ro.cc_code || ro.ROID || ro['RO ID']);
     if (!cc) return null;
+    // Global Territory filter (shared by every menu)
+    if (window.GlobalScope && !GlobalScope.match(ro.territory || ro.Territory)) return null;
     const map = (window.activeMappings && window.activeMappings[cc]) || {};
     const onb_mpd = num(ro.onb_mpd), onl_mpd = num(ro.onl_mpd);
     const onb_tnk = num(ro.onb_tnk), onl_tnk = num(ro.onl_tnk);
@@ -117,6 +119,7 @@
       cc,
       name: ro.outlet_name || map.outlet_name || `RO ${cc}`,
       area: ro.sales_area || map.sales_area || 'Unmapped',
+      territory: ro.territory || map.territory || '',
       vendor: ro.vendor || map.vendor || 'Unmapped',
       eo: ro.eo_name && ro.eo_name !== 'Unmapped' ? ro.eo_name : (map.eo_name || 'Unmapped'),
       so: ro.so_name && ro.so_name !== 'Unmapped' ? ro.so_name : (map.so_name || 'Unmapped'),
