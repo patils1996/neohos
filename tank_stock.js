@@ -62,6 +62,96 @@
     return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  function formatStockDateTime(dateVal, timeVal) {
+    let dateStr = '';
+    let timeStr = '';
+
+    // 1. Process dateVal
+    if (dateVal instanceof Date && !isNaN(dateVal.getTime())) {
+      const y = dateVal.getFullYear();
+      const m = String(dateVal.getMonth() + 1).padStart(2, '0');
+      const d = String(dateVal.getDate()).padStart(2, '0');
+      dateStr = `${y}-${m}-${d}`;
+      if (!timeVal && (dateVal.getHours() !== 0 || dateVal.getMinutes() !== 0 || dateVal.getSeconds() !== 0)) {
+        const h = dateVal.getHours();
+        const mins = String(dateVal.getMinutes()).padStart(2, '0');
+        const ap = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 || 12;
+        timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+      }
+    } else if (typeof dateVal === 'number' && dateVal > 20000 && dateVal < 80000) {
+      const base = new Date(Date.UTC(1899, 11, 30));
+      const dt = new Date(base.getTime() + Math.floor(dateVal) * 86400000);
+      const y = dt.getUTCFullYear();
+      const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
+      const d = String(dt.getUTCDate()).padStart(2, '0');
+      dateStr = `${y}-${m}-${d}`;
+      const frac = dateVal - Math.floor(dateVal);
+      if (!timeVal && frac > 0.0001) {
+        const totalSec = Math.round(frac * 86400);
+        const h = Math.floor(totalSec / 3600) % 24;
+        const mins = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+        const ap = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 || 12;
+        timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+      }
+    } else if (typeof dateVal === 'string' && dateVal.trim()) {
+      const rawD = dateVal.trim();
+      if (/^\d{5}(\.\d+)?$/.test(rawD)) {
+        const numD = parseFloat(rawD);
+        if (numD > 20000 && numD < 80000) return formatStockDateTime(numD, timeVal);
+      }
+      if (rawD.includes('T') || (rawD.includes(' ') && /[\d:-]/.test(rawD))) {
+        const parsed = new Date(rawD);
+        if (!isNaN(parsed.getTime())) return formatStockDateTime(parsed, timeVal);
+      }
+      dateStr = rawD;
+    }
+
+    // 2. Process timeVal
+    if (timeVal instanceof Date && !isNaN(timeVal.getTime())) {
+      const h = timeVal.getHours();
+      const mins = String(timeVal.getMinutes()).padStart(2, '0');
+      const ap = h >= 12 ? 'PM' : 'AM';
+      const h12 = h % 12 || 12;
+      timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+    } else if (typeof timeVal === 'number' && timeVal >= 0 && timeVal < 1) {
+      const totalSec = Math.round(timeVal * 86400);
+      const h = Math.floor(totalSec / 3600) % 24;
+      const mins = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+      const ap = h >= 12 ? 'PM' : 'AM';
+      const h12 = h % 12 || 12;
+      timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+    } else if (typeof timeVal === 'string' && timeVal.trim()) {
+      const rawT = timeVal.trim();
+      if (/^0\.\d+$/.test(rawT)) {
+        const numT = parseFloat(rawT);
+        if (numT >= 0 && numT < 1) {
+          const totalSec = Math.round(numT * 86400);
+          const h = Math.floor(totalSec / 3600) % 24;
+          const mins = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+          const ap = h >= 12 ? 'PM' : 'AM';
+          const h12 = h % 12 || 12;
+          timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+        }
+      } else {
+        const m = rawT.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+        if (m) {
+          let h = parseInt(m[1], 10);
+          const mins = m[2];
+          const ap = m[3] ? m[3].toUpperCase() : (h >= 12 ? 'PM' : 'AM');
+          const h12 = m[3] ? h : (h % 12 || 12);
+          timeStr = `${String(h12).padStart(2, '0')}:${mins} ${ap}`;
+        } else {
+          timeStr = rawT;
+        }
+      }
+    }
+
+    if (dateStr && timeStr) return `${dateStr} ${timeStr}`;
+    return dateStr || timeStr || '—';
+  }
+
   // ---- IndexedDB Persistence for DirectoryHandle ----
   function getStoredFolderHandle() {
     return new Promise(resolve => {
@@ -728,13 +818,40 @@
     let morning = t.Morning_Status || t['Morning Status'] || '—';
     let evening = t.Evening_Status || t['Evening Status'] || '—';
     let onlineHrs = t.Online_hours ?? t['Online hours'] ?? t['Online_Hours'];
-    let tableUpdated = t.Table_updated_at || t['Table updated at'] || t['Updated_at'] || '—';
-    let isEbms = p.includes('EBMS') || p.includes('MS');
-    let color = isEbms ? '#22bd42' : (p.includes('HSD') ? '#079fe8' : '#f59e0b');
     let displayProduct = p || (hr ? key(hr._product || hr['Product Name']) : '') || 'FUEL';
+    let isEbms = displayProduct.includes('EBMS') || displayProduct.includes('MS');
+    let color = isEbms ? '#22bd42' : (displayProduct.includes('HSD') ? '#079fe8' : '#f59e0b');
     let gaugePct = current != null ? Math.max(0, Math.min(100, current)) : 0;
 
-    return `<div class="tank" data-tank="${esc(id)}" data-product="${esc(displayProduct)}"><div class="tanktop"><div class="tanktitle">Tank ${esc(id)} <small>(${fmt(capacity, 2)} KL)</small></div><div>${status === 'ONLINE' ? '🔒' : '⚠️'} <span class="tankproduct product-${displayProduct.toLowerCase()}">${esc(displayProduct)}</span></div></div><div class="tankmeta"><span>◈ ${esc(up)} uptime</span><span class="tag">${esc(morning)} / ${esc(evening)}</span></div><div class="gauge" style="--pct:${gaugePct};--gauge:${color}"><span>${current == null ? '—' : fmt(current, 2) + '%'}</span></div><div class="tankstats"><div><div class="statlabel">First reported %</div><div class="statvalue">${first == null ? '—' : fmt(first, 2) + '%'}</div></div><div style="text-align:right"><div class="statlabel">Latest hourly %</div><div class="statvalue">${current == null ? '—' : fmt(current, 2) + '%'}</div></div><div><div class="statlabel">Onboarded tankage</div><div class="statvalue">${fmt(capacity, 2)} KL</div></div><div style="text-align:right"><div class="statlabel">Online hours</div><div class="statvalue">${onlineHrs != null ? fmt(num(onlineHrs)) : '—'} / 24</div></div></div><div class="tankbottom"><div><div class="statlabel">Table updated</div><div class="statvalue">${esc(tableUpdated)}</div></div><div style="text-align:right"><div class="statlabel">Status</div><span class="pill ${status === 'OFFLINE' ? 'off' : status === 'ONLINE' ? '' : 'partial'}">${esc(t.Status || 'Unknown')}</span></div></div></div>`;
+    // Resolve last stock updated date & time from Latest Stock records (Last updated stock.xlsx / Google Sheet)
+    let stockRec = null;
+    let prodKey = key(displayProduct);
+    if (ro && ro.latest && ro.latest.length) {
+      stockRec = ro.latest.find(r => {
+        let rp = key(r['Product Name'] || r._product || '');
+        return rp && prodKey && (rp.includes(prodKey) || prodKey.includes(rp));
+      });
+      if (!stockRec) {
+        stockRec = ro.latest[0];
+      }
+    }
+
+    let stockUpdated = '—';
+    if (stockRec) {
+      let dVal = stockRec.Date ?? stockRec.date ?? stockRec['Stock Date'] ?? stockRec['Reading Date'];
+      let tVal = stockRec.Time ?? stockRec.time ?? stockRec['Stock Time'] ?? stockRec['Reading Time'];
+      if (!dVal && !tVal) {
+        const tsKey = Object.keys(stockRec).find(k => /(last\s*updated|updated\s*(at|on|time)|date\s*time|timestamp)/i.test(k));
+        if (tsKey) dVal = stockRec[tsKey];
+      }
+      stockUpdated = formatStockDateTime(dVal, tVal);
+    }
+    if (stockUpdated === '—') {
+      let alt = t['Last stock updated'] || t['Last updated'] || t.Table_updated_at || t['Table updated at'] || t['Updated_at'];
+      if (alt) stockUpdated = formatStockDateTime(alt, null);
+    }
+
+    return `<div class="tank" data-tank="${esc(id)}" data-product="${esc(displayProduct)}"><div class="tanktop"><div class="tanktitle">Tank ${esc(id)} <small>(${fmt(capacity, 2)} KL)</small></div><div>${status === 'ONLINE' ? '🔒' : '⚠️'} <span class="tankproduct product-${displayProduct.toLowerCase()}">${esc(displayProduct)}</span></div></div><div class="tankmeta"><span>◈ ${esc(up)} uptime</span><span class="tag">${esc(morning)} / ${esc(evening)}</span></div><div class="gauge" style="--pct:${gaugePct};--gauge:${color}"><span>${current == null ? '—' : fmt(current, 2) + '%'}</span></div><div class="tankstats"><div><div class="statlabel">First reported %</div><div class="statvalue">${first == null ? '—' : fmt(first, 2) + '%'}</div></div><div style="text-align:right"><div class="statlabel">Latest hourly %</div><div class="statvalue">${current == null ? '—' : fmt(current, 2) + '%'}</div></div><div><div class="statlabel">Onboarded tankage</div><div class="statvalue">${fmt(capacity, 2)} KL</div></div><div style="text-align:right"><div class="statlabel">Online hours</div><div class="statvalue">${onlineHrs != null ? fmt(num(onlineHrs)) : '—'} / 24</div></div></div><div class="tankbottom"><div><div class="statlabel" title="Last stock updated date and time">Stock updated</div><div class="statvalue">${esc(stockUpdated)}</div></div><div style="text-align:right"><div class="statlabel">Status</div><span class="pill ${status === 'OFFLINE' ? 'off' : status === 'ONLINE' ? '' : 'partial'}">${esc(t.Status || 'Unknown')}</span></div></div></div>`;
   }
 
   function showHourly(roId, tankId, product) {
@@ -1036,8 +1153,14 @@
   const tankCap = t => num(t['On-Boarded Tankage (KL)'] ?? t['On-boarded Tankage'] ?? t.Tankage);
   const tankSt = t => { const k = key(t.Status); return k === 'ONLINE' ? 'Online' : k === 'OFFLINE' ? 'Offline' : (t.Status ? String(t.Status) : '—'); };
   const recTime = rec => {
-    const k = Object.keys(rec).find(c => /(last\s*updated|updated\s*(at|on|time)|date\s*time|timestamp|reading\s*time|^date$|^time$)/i.test(c));
-    return k ? rec[k] : '';
+    let dVal = rec.Date ?? rec.date ?? rec['Stock Date'] ?? rec['Reading Date'];
+    let tVal = rec.Time ?? rec.time ?? rec['Stock Time'] ?? rec['Reading Time'];
+    if (!dVal && !tVal) {
+      const k = Object.keys(rec).find(c => /(last\s*updated|updated\s*(at|on|time)|date\s*time|timestamp|reading\s*time|^date$|^time$)/i.test(c));
+      if (k) dVal = rec[k];
+    }
+    const formatted = formatStockDateTime(dVal, tVal);
+    return formatted !== '—' ? formatted : '';
   };
 
   function kpiDataset(id) {
